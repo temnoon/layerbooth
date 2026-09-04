@@ -1,0 +1,16 @@
+pkgbase = layerbooth
+	pkgdesc = Photobooth with layers: live V4L2 camera controls, edge detection, gradients, blend modes, presets, and a stdin/stdout render CLI
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/temnoon/layerbooth
+	arch = any
+	license = MIT
+	depends = python
+	depends = ffmpeg
+	depends = v4l-utils
+	optdepends = chromium: panel window and headless rendering (any Chromium-based browser works)
+	optdepends = libnotify: snapshot notifications outside Omarchy
+	source = layerbooth-0.1.0.tar.gz::https://github.com/temnoon/layerbooth/archive/v0.1.0.tar.gz
+	sha256sums = 3c9fc2cf5ccb22d12dd19170418d8b156ec62278210b2ff9b615ca5feea291d2
+
+pkgname = layerbooth
