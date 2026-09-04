@@ -20,7 +20,7 @@ Usage:
                                        apply a layer stack to an image: reads INPUT (or stdin),
                                        writes the composited image to --out (or stdout)
 """
-import json, os, re, signal, socket, subprocess, sys, threading, time
+import json, os, re, secrets, signal, socket, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, unquote
 
@@ -142,7 +142,7 @@ def load_presets():
 
 def safe_name(text):
     text = re.sub(r"[/\\:*?\"<>|\x00-\x1f]+", "-", str(text)).strip(" .")
-    return text or "untitled"
+    return text[:200] or "untitled"
 
 def snapshot_path(settings, preset, ext, create=True):
     """Expand the filename template. [n] is the lowest counter that doesn't collide."""
@@ -154,7 +154,9 @@ def snapshot_path(settings, preset, ext, create=True):
     name = name.replace("[date]", time.strftime("%Y-%m-%d", now))
     name = name.replace("[time]", time.strftime("%H-%M-%S", now))
     name = name.replace("[datetime]", time.strftime("%Y%m%d-%H%M%S", now))
-    name = safe_name(name) if "/" not in name else name  # allow sub-folders in the template
+    # "/" makes sub-folders, but every segment is sanitised and ".." / absolute paths are refused
+    parts = [safe_name(seg) for seg in name.split("/") if seg.strip(" .")]
+    name = "/".join(parts) or "untitled"
     if not name.lower().endswith(ext):
         name += ext
     if create:
@@ -254,14 +256,57 @@ class Streamer:
             self.lock.wait_for(lambda: self.seq != seen, timeout=2)
             return self.frame, self.seq
 
-# ---------------------------------------------------------------- web
-class Handler(BaseHTTPRequestHandler):
-    streamer: Streamer = None
-    colors: dict = {}
-    server_ref = None
+# ---------------------------------------------------------------- request guard
+MAX_JSON_BODY = 1 << 20        # 1 MiB of JSON is plenty for a layer stack
+MAX_IMAGE_BODY = 64 << 20      # composited snapshot / render result
+
+class Guarded(BaseHTTPRequestHandler):
+    """Every request must carry the per-run token, come from our own origin, and
+    address our own host. That keeps other local users, DNS-rebinding pages and
+    cross-site requests from any web page out of the camera and the filesystem."""
+    token = ""
+    port = 0
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
         pass
+
+    def authorized(self):
+        host = self.headers.get("Host", "")
+        if host != f"127.0.0.1:{self.port}":
+            return False
+        origin = self.headers.get("Origin")
+        if origin and origin != f"http://127.0.0.1:{self.port}":
+            return False
+        q = parse_qs(urlparse(self.path).query)
+        supplied = self.headers.get("X-Token") or (q.get("t") or [""])[0]
+        return bool(self.token) and secrets.compare_digest(supplied, self.token)
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        if self.authorized():
+            return True
+        self.send_error(403, "Forbidden")
+        self.close_connection = True
+        return False
+
+    def read_body(self, limit):
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            n = -1
+        if n < 0 or n > limit:
+            self.send_error(413, "Body too large")
+            self.close_connection = True
+            return None
+        return self.rfile.read(n)
+
+# ---------------------------------------------------------------- web
+class Handler(Guarded):
+    streamer: Streamer = None
+    colors: dict = {}
+    server_ref = None
 
     def _json(self, obj, code=200):
         body = json.dumps(obj).encode()
@@ -272,13 +317,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(n) or b"{}")
+        raw = self.read_body(MAX_JSON_BODY)
+        if raw is None:
+            raise ValueError("body too large")
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            body = {}
+        return body if isinstance(body, dict) else {}
 
     def do_GET(self):
         u = urlparse(self.path)
         if u.path in ("/", "/layerbooth"):
-            body = PAGE.replace("/*THEME*/", theme_css(self.colors)).encode()
+            body = (PAGE.replace("/*THEME*/", theme_css(self.colors))
+                        .replace("/*TOKEN*/", self.token)).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -292,10 +344,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        try:
+            self._post()
+        except ValueError:
+            pass  # read_body already answered 413
+
+    def _post(self):
         u = urlparse(self.path)
         p = load_presets()
         if u.path == "/set":
-            ok, err = set_controls(self._body())
+            known = {c["name"] for c in list_controls()}
+            wanted = {}
+            for k, v in self._body().items():
+                if k in known and isinstance(v, (int, float, bool)):
+                    wanted[k] = int(v)
+            ok, err = set_controls(wanted)
             self._json({"ok": ok, "error": err, "controls": list_controls()})
         elif u.path == "/reset":
             defaults = {c["name"]: c["default"] for c in list_controls()}
@@ -334,8 +397,9 @@ class Handler(BaseHTTPRequestHandler):
             preset = unquote(self.headers.get("X-Preset", ""))
             if self.headers.get("Content-Type", "").startswith("image/png"):
                 # composited frame rendered by the page
-                n = int(self.headers.get("Content-Length", 0))
-                frame = self.rfile.read(n)
+                frame = self.read_body(MAX_IMAGE_BODY)
+                if frame is None:
+                    return
                 ext = ".png"
             else:
                 frame, _ = self.streamer.next_frame(-1)
@@ -512,7 +576,12 @@ function composite(){
 
 LOAD_LAYERS = r"""function loadLayers(ls){
   if(!ls||!ls.length) ls=[{type:'camera'}];
-  layers=ls.map(L=>{const d=defaultLayer(L.type||'camera'); const m={...d.mask,...(L.mask||{})}; return {...d,...L,id:uid++,mask:m}});
+  const okColor=c=>/^#[0-9a-fA-F]{6}$/.test(c);
+  layers=ls.map(L=>{const d=defaultLayer(TYPE_NAME[L.type]?L.type:'camera'); const m={...d.mask,...(L.mask||{})}; const out={...d,...L,id:uid++,mask:m};
+    if(!BLENDS.includes(out.blend)) out.blend='source-over';
+    for(const k of ['color','color2']) if(out[k]!==undefined && !okColor(out[k])) out[k]=d[k]||'#000000';
+    for(const k of ['opacity','threshold','thickness','smooth','alpha1','alpha2','angle']) if(out[k]!==undefined) out[k]=Number(out[k])||0;
+    return out});
   renderLayers();
 }
 """
@@ -606,13 +675,16 @@ input[type=color]{width:36px;height:24px;padding:0;border:1px solid var(--muted)
   <div class="status">Tokens: [preset] [date] [time] [datetime] [n] &nbsp;·&nbsp; a / makes sub-folders &nbsp;·&nbsp; extension is added automatically</div>
   <div class="row"><span class="status" id="sexample" style="flex:1"></span><button onclick="saveSettings()">Save settings</button></div>
 </aside>
-<img id="cam" src="/stream" alt="" hidden>
+<img id="cam" alt="" hidden>
 <script>
 const $=s=>document.querySelector(s);
+const TOKEN='/*TOKEN*/';
+const esc=v=>String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+$('#cam').src='/stream?t='+encodeURIComponent(TOKEN);
 let W=1280,H=720;
 let state={controls:[],presets:{presets:{},login:null,settings:{}}};
 let currentPreset='';
-const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json());
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json','X-Token':TOKEN},body:JSON.stringify(b||{})}).then(r=>r.json());
 const say=m=>{$('#status').textContent=m; setTimeout(()=>{if($('#status').textContent===m)$('#status').textContent=''},3000)};
 $('#mirror').onchange=e=>$('#out').classList.toggle('mirror',e.target.checked);
 $('#mirror').onchange({target:$('#mirror')});
@@ -623,13 +695,13 @@ function renderControls(){
   for(const c of state.controls){
     const d=document.createElement('div'); d.className='ctl'+(c.type==='bool'?' bool':'');
     if(c.type==='bool'){
-      d.innerHTML=`<input type="checkbox" id="c_${c.name}" ${c.value?'checked':''} ${c.inactive?'disabled':''}><label for="c_${c.name}">${c.label}</label>`;
+      d.innerHTML=`<input type="checkbox" id="c_${esc(c.name)}" ${c.value?'checked':''} ${c.inactive?'disabled':''}><label for="c_${esc(c.name)}">${esc(c.label)}</label>`;
       d.querySelector('input').onchange=e=>setCtl(c.name,e.target.checked?1:0);
     }else if(c.menu&&c.menu.length){
-      d.innerHTML=`<label>${c.label}</label><span></span><select ${c.inactive?'disabled':''}>${c.menu.map(m=>`<option value="${m.value}" ${m.value===c.value?'selected':''}>${m.label}</option>`).join('')}</select>`;
+      d.innerHTML=`<label>${esc(c.label)}</label><span></span><select ${c.inactive?'disabled':''}>${c.menu.map(m=>`<option value="${+m.value}" ${m.value===c.value?'selected':''}>${esc(m.label)}</option>`).join('')}</select>`;
       d.querySelector('select').onchange=e=>setCtl(c.name,+e.target.value);
     }else{
-      d.innerHTML=`<label>${c.label}</label><span class="val">${c.value}</span><input type="range" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.value}" ${c.inactive?'disabled':''}>`;
+      d.innerHTML=`<label>${esc(c.label)}</label><span class="val">${+c.value}</span><input type="range" min="${+c.min}" max="${+c.max}" step="${+c.step}" value="${+c.value}" ${c.inactive?'disabled':''}>`;
       const r=d.querySelector('input'), v=d.querySelector('.val');
       r.oninput=e=>{v.textContent=e.target.value; setCtl(c.name,+e.target.value,true)};
       r.ondblclick=()=>{r.value=c.default; r.oninput({target:r})};
@@ -653,7 +725,7 @@ function removeLayer(i){layers.splice(i,1); renderLayers()}
 const TYPE_NAME={camera:'Camera',edges:'Edges',color:'Colour',gradient:'Gradient'};
 function range(label,key,min,max,step,obj,fmt){
   const v=obj[key]; const id='r'+Math.random().toString(36).slice(2);
-  return `<label>${label}</label><div class="ctl"><span class="val" id="${id}v">${fmt?fmt(v):v}</span><input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${v}" data-key="${key}"></div>`;
+  return `<label>${esc(label)}</label><div class="ctl"><span class="val" id="${id}v">${esc(fmt?fmt(v):v)}</span><input type="range" id="${id}" min="${+min}" max="${+max}" step="${+step}" value="${+v}" data-key="${esc(key)}"></div>`;
 }
 function renderLayers(){
   const box=$('#layers'); box.innerHTML='';
@@ -669,15 +741,15 @@ function renderLayers(){
       ${range('Threshold','threshold',0,1,0.01,L)}
       ${range('Thickness','thickness',0.5,4,0.1,L)}
       ${range('Smoothing','smooth',0,6,0.1,L)}
-      <label>Edge colour</label><div class="row"><input type="color" data-key="color" value="${L.color}"></div>
+      <label>Edge colour</label><div class="row"><input type="color" data-key="color" value="${esc(L.color)}"></div>
       <label>Background</label><select data-key="bg"><option value="transparent" ${L.bg==='transparent'?'selected':''}>transparent</option><option value="black" ${L.bg==='black'?'selected':''}>black</option><option value="camera" ${L.bg==='camera'?'selected':''}>camera image</option></select>
       <label>Invert</label><input type="checkbox" data-key="invert" ${L.invert?'checked':''}>`;
-    if(L.type==='color') body+=`<label>Colour</label><div class="row"><input type="color" data-key="color" value="${L.color}"></div>`;
+    if(L.type==='color') body+=`<label>Colour</label><div class="row"><input type="color" data-key="color" value="${esc(L.color)}"></div>`;
     if(L.type==='gradient') body+=`
       <label>Shape</label><select data-key="shape"><option value="linear" ${L.shape==='linear'?'selected':''}>linear</option><option value="radial" ${L.shape==='radial'?'selected':''}>radial</option></select>
-      <label>Colour A</label><div class="row"><input type="color" data-key="color" value="${L.color}"></div>
+      <label>Colour A</label><div class="row"><input type="color" data-key="color" value="${esc(L.color)}"></div>
       ${range('Alpha A','alpha1',0,1,0.01,L,v=>Math.round(v*100)+'%')}
-      <label>Colour B</label><div class="row"><input type="color" data-key="color2" value="${L.color2}"></div>
+      <label>Colour B</label><div class="row"><input type="color" data-key="color2" value="${esc(L.color2)}"></div>
       ${range('Alpha B','alpha2',0,1,0.01,L,v=>Math.round(v*100)+'%')}
       ${range('Angle','angle',0,360,1,L,v=>v+'°')}`;
     body+=`</div><div class="sub"><h3>Alpha mask</h3><div class="grid">
@@ -690,7 +762,7 @@ function renderLayers(){
       <label>Invert</label><input type="checkbox" data-key="mask.invert" ${L.mask.invert?'checked':''}>
     </div></div>`;
     d.innerHTML=`<summary><input type="checkbox" ${L.enabled?'checked':''} data-key="enabled" title="Enable" onclick="event.stopPropagation()">
-      <span class="lname">${TYPE_NAME[L.type]}</span><span class="dim">${BLEND_LABEL[L.blend]||L.blend} · ${Math.round(L.opacity*100)}%</span>
+      <span class="lname">${esc(TYPE_NAME[L.type]||L.type)}</span><span class="dim">${esc(BLEND_LABEL[L.blend]||L.blend)} · ${Math.round(L.opacity*100)}%</span>
       <button class="icon" title="Move up (toward front)">▲</button><button class="icon" title="Move down">▼</button><button class="icon danger" title="Delete">✕</button></summary>
       <div class="layer-body">${body}</div>`;
     const [up,down,del]=d.querySelectorAll('summary button');
@@ -729,7 +801,7 @@ function cleanLayers(){return layers.map(({_open,...L})=>L)}
   for(const n of names){
     const d=document.createElement('div'); d.className='preset';
     const on=state.presets.login===n;
-    d.innerHTML=`<span class="name ${n===currentPreset?'current':''}">${n}</span><span class="login ${on?'on':''}" title="Apply this preset at login">${on?'★ login':'☆ login'}</span><span class="x" title="Delete">✕</span>`;
+    d.innerHTML=`<span class="name ${n===currentPreset?'current':''}">${esc(n)}</span><span class="login ${on?'on':''}" title="Apply this preset at login">${on?'★ login':'☆ login'}</span><span class="x" title="Delete">✕</span>`;
     d.querySelector('.name').onclick=()=>applyPreset(n);
     d.querySelector('.login').onclick=()=>setLogin(on?null:n);
     d.querySelector('.x').onclick=()=>deletePreset(n);
@@ -748,7 +820,7 @@ async function deletePreset(n){if(!confirm(`Delete preset "${n}"?`))return; cons
 async function setLogin(n){const r=await post('/preset/login',{name:n}); state.presets=r.presets; renderPresets(); say(n?`"${n}" will be applied at login`:'No preset at login')}
 async function snap(){
   const blob=await new Promise(res=>out.toBlob(res,'image/png'));
-  const r=await fetch('/snapshot',{method:'POST',headers:{'Content-Type':'image/png','X-Preset':encodeURIComponent(currentPreset)},body:blob}).then(r=>r.json());
+  const r=await fetch('/snapshot',{method:'POST',headers:{'Content-Type':'image/png','X-Token':TOKEN,'X-Preset':encodeURIComponent(currentPreset)},body:blob}).then(r=>r.json());
   say(r.ok?'Saved '+r.path.split('/').pop():r.error);
 }
 /* ---------------- snapshot settings ---------------- */
@@ -764,16 +836,20 @@ $('#stemplate').oninput=previewName;
 async function saveSettings(){const r=await post('/settings',{folder:$('#sfolder').value,template:$('#stemplate').value,preset:currentPreset}); if(r.ok){state.presets.settings=r.settings; $('#sfolder').value=r.settings.folder; $('#stemplate').value=r.settings.template; $('#sexample').textContent='e.g. '+r.example; say('Snapshot settings saved')} else say(r.error)}
 async function openFolder(){await saveSettings(); post('/open-folder')}
 async function quit(){await post('/quit'); window.close(); document.body.innerHTML='<p style="padding:2em">Camera panel closed.</p>'}
-fetch('/state').then(r=>r.json()).then(s=>{state=s; renderControls(); renderPresets(); renderLayers(); loadSettings();
+fetch('/state',{headers:{'X-Token':TOKEN}}).then(r=>r.json()).then(s=>{state=s; renderControls(); renderPresets(); renderLayers(); loadSettings();
   if(s.presets.login) applyPreset(s.presets.login); // open with the login look, layers included
 });
 </script></body></html>""")
 
 RENDER_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>render</title></head>
-<body style="margin:0;background:#000"><canvas id="out"></canvas><img id="cam" src="/input" alt="" hidden>
+<body style="margin:0;background:#000"><canvas id="out"></canvas><img id="cam" alt="" hidden>
 <script>
 const $=s=>document.querySelector(s);
+const TOKEN='/*TOKEN*/';
+$('#cam').src='/input?t='+encodeURIComponent(TOKEN);
 let W=1280,H=720; let uid=1;
+const BLENDS=['source-over','multiply','screen','overlay','darken','lighten','color-dodge','color-burn','hard-light','soft-light','difference','exclusion','hue','saturation','color','luminosity'];
+const TYPE_NAME={camera:'Camera',edges:'Edges',color:'Colour',gradient:'Gradient'};
 /*LAYER_DEF*/
 let layers=[defaultLayer('camera')];
 function renderLayers(){}
@@ -785,16 +861,16 @@ async function go(){
   loadLayers(/*LAYERS_JSON*/);
   composite();
   const blob=await new Promise(res=>out.toBlob(res, FORMAT, QUALITY));
-  const r=await fetch('/render-result',{method:'POST',headers:{'Content-Type':FORMAT},body:blob});
+  const r=await fetch('/render-result',{method:'POST',headers:{'Content-Type':FORMAT,'X-Token':TOKEN},body:blob});
   document.title = r.ok ? 'done' : 'failed';
 }
 if(cam.complete&&cam.naturalWidth) go(); else cam.onload=go;
-cam.onerror=()=>fetch('/render-result',{method:'POST',headers:{'Content-Type':'text/plain'},body:'input image failed to decode'});
+cam.onerror=()=>fetch('/render-result',{method:'POST',headers:{'Content-Type':'text/plain','X-Token':TOKEN},body:'input image failed to decode'});
 </script></body></html>"""
 
 
 # ---------------------------------------------------------------- headless render (CLI)
-class RenderHandler(BaseHTTPRequestHandler):
+class RenderHandler(Guarded):
     input_bytes = b""
     input_type = "image/jpeg"
     layers = []
@@ -803,15 +879,14 @@ class RenderHandler(BaseHTTPRequestHandler):
     result = None
     done = threading.Event()
 
-    def log_message(self, *a):
-        pass
-
     def do_GET(self):
-        if self.path.startswith("/render"):
-            body = (assemble(RENDER_PAGE).replace("/*LAYERS_JSON*/", json.dumps(self.layers))
-                    .replace("/*FORMAT*/", self.fmt).replace("/*QUALITY*/", str(self.quality))).encode()
+        path = urlparse(self.path).path
+        if path == "/render":
+            body = (assemble(RENDER_PAGE).replace("/*LAYERS_JSON*/", json.dumps(self.layers).replace("</", "<\\/"))
+                    .replace("/*FORMAT*/", self.fmt).replace("/*QUALITY*/", str(float(self.quality)))
+                    .replace("/*TOKEN*/", self.token)).encode()
             ctype = "text/html; charset=utf-8"
-        elif self.path == "/input":
+        elif path == "/input":
             body, ctype = self.input_bytes, self.input_type
         else:
             return self.send_error(404)
@@ -822,8 +897,9 @@ class RenderHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        n = int(self.headers.get("Content-Length", 0))
-        data = self.rfile.read(n)
+        data = self.read_body(MAX_IMAGE_BODY)
+        if data is None:
+            return
         if self.headers.get("Content-Type", "").startswith("text/plain"):
             RenderHandler.result = ("error", data.decode(errors="replace"))
         else:
@@ -890,13 +966,15 @@ def render_cli(args):
     RenderHandler.result = None
     RenderHandler.done.clear()
     port = free_port()
+    RenderHandler.token = secrets.token_urlsafe(32)
+    RenderHandler.port = port
     httpd = ThreadingHTTPServer(("127.0.0.1", port), RenderHandler)
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix="layerbooth-render-", dir=os.environ.get("XDG_RUNTIME_DIR")) as profile:
         proc = subprocess.Popen([browser, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
                                  "--disable-extensions", f"--user-data-dir={profile}", "--window-size=1280,720",
-                                 f"http://127.0.0.1:{port}/render"],
+                                 f"http://127.0.0.1:{port}/render?t={RenderHandler.token}"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         ok = RenderHandler.done.wait(60)
         proc.terminate()
@@ -937,12 +1015,14 @@ def cli_apply(name):
 
 def serve():
     port = free_port()
+    Handler.token = secrets.token_urlsafe(32)
+    Handler.port = port
     Handler.streamer = Streamer(DEVICE)
     Handler.colors = theme_colors()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     httpd.daemon_threads = True
     Handler.server_ref = httpd
-    url = f"http://127.0.0.1:{port}/layerbooth"  # path becomes part of Chromium's app id
+    url = f"http://127.0.0.1:{port}/layerbooth?t={Handler.token}"  # path becomes part of Chromium's app id
     if "--no-browser" not in sys.argv:
         which = __import__("shutil").which
         if which("omarchy-launch-webapp"):
