@@ -22,6 +22,9 @@ Usage:
                               [--quality 0-1] [--out FILE] [INPUT|-]
                                        apply a layer stack to an image: reads INPUT (or stdin),
                                        writes the composited image to --out (or stdout)
+  layerbooth page [--preset NAME | --layers FILE] [--paper A5] [--structure dots] [--out page.json]
+                                       render a look at paper size and write a gravity-press
+                                       PageSpec v1 (or a DocumentSpec with --document COUNT)
 """
 import json, os, re, secrets, signal, socket, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1288,6 +1291,142 @@ def render_cli(args):
         sys.stdout.buffer.write(payload); sys.stdout.buffer.flush()
     return 0
 
+# ---------------------------------------------------------------- page export (gravity-press PageSpec v1)
+PAPER_IN = {"LETTER": (8.5, 11), "A4": (8.27, 11.69), "A5": (5.83, 8.27), "HALF_LETTER": (5.5, 8.5)}
+PAPER_TRIM = {"LETTER": "0850X1100", "A5": "0583X0827", "HALF_LETTER": "0550X0850"}  # Lulu trims; A4 has none
+STRUCTURES = {"lines": "lined", "dots": "dot", "grid": "cartesian", "polar": "polar"}
+
+def blank_png(w, h):
+    """A transparent w×h PNG without Pillow: one filter byte + RGBA zeros per row."""
+    import struct, zlib
+    raw = b"".join(b"\x00" + b"\x00" * (w * 4) for _ in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+def render_headless(data, layers, fmt="image/png", quality=0.92):
+    """Composite `layers` over the input image bytes with the page's own compositor. Returns bytes."""
+    import tempfile
+    browser = find_browser()
+    if not browser:
+        raise RuntimeError("needs a Chromium-based browser for headless rendering")
+    RenderHandler.input_bytes = data
+    RenderHandler.input_type = sniff_type(data)
+    RenderHandler.layers = layers
+    RenderHandler.fmt = fmt
+    RenderHandler.quality = max(0.0, min(1.0, quality))
+    RenderHandler.result = None
+    RenderHandler.done.clear()
+    port = free_port()
+    RenderHandler.token = secrets.token_urlsafe(32)
+    RenderHandler.port = port
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), RenderHandler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="layerbooth-render-", dir=os.environ.get("XDG_RUNTIME_DIR"),
+                                         ignore_cleanup_errors=True) as profile:
+            proc = subprocess.Popen([browser, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                                     "--disable-extensions", f"--user-data-dir={profile}", "--window-size=1280,720",
+                                     f"http://127.0.0.1:{port}/render?t={RenderHandler.token}"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ok = RenderHandler.done.wait(90)
+            proc.terminate()
+            try: proc.wait(5)
+            except subprocess.TimeoutExpired: proc.kill()
+    finally:
+        httpd.shutdown()
+    if not ok or RenderHandler.result is None:
+        raise RuntimeError("browser produced no output within 90s")
+    status, payload = RenderHandler.result
+    if status != "ok":
+        raise RuntimeError(payload)
+    return payload
+
+def build_page_spec(layers, paper="LETTER", dpi=150, ground="image", wash_opacity=0.12, structure="none",
+                    input_bytes=None, preset=None):
+    """Render the look at paper size and wrap it as a gravity-press PageSpec v1."""
+    import base64
+    if paper not in PAPER_IN:
+        raise ValueError(f"paper must be one of {', '.join(PAPER_IN)}")
+    w_in, h_in = PAPER_IN[paper]
+    w, h = int(round(w_in * dpi)), int(round(h_in * dpi))
+    if input_bytes is None:
+        input_bytes = blank_png(w, h)          # camera layers draw nothing; SVG/gradient/colour layers carry the page
+    png = render_headless(input_bytes, layers)
+    image_cfg = {"version": 1, "type": "image", "paper": paper,
+                 "src": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+                 "fit": "cover", "offsetX": 0, "offsetY": 0, "imageWidth": w, "imageHeight": h}
+    if ground == "wash":
+        g = {"kind": "wash", "config": image_cfg, "opacity": max(0.02, min(0.5, float(wash_opacity)))}
+    else:
+        g = {"kind": "image", "config": image_cfg}
+    spec = {"version": 1, "paper": paper, "ground": g, "structure": [], "content": [], "overlay": []}
+    if structure and structure != "none":
+        if structure not in STRUCTURES:
+            raise ValueError(f"structure must be one of none, {', '.join(STRUCTURES)}")
+        spec["structure"].append({"kind": structure, "config": {"version": 1, "type": STRUCTURES[structure], "paper": paper}})
+    # Kept for re-editing in Layerbooth; the PageSpec parser drops unknown keys.
+    spec["layerbooth"] = {"preset": preset, "layers": layers, "dpi": dpi, "rendered": {"width": w, "height": h}}
+    return spec
+
+def page_cli(args):
+    """page [--preset NAME | --layers FILE] [--paper LETTER|A4|A5|HALF_LETTER] [--dpi N]
+         [--ground image|wash] [--wash-opacity 0.12] [--structure none|lines|dots|grid|polar]
+         [--input IMAGE|-] [--document COUNT] [--title T] [--out FILE]
+    Renders a look at paper size and writes a gravity-press PageSpec v1 (or a DocumentSpec with
+    --document) as JSON to --out or stdout. Without --input the camera layers are blank."""
+    preset = layers_file = out = inp = title = None
+    paper, dpi, ground, wash, structure, count = "LETTER", 150, "image", 0.12, "none", 0
+    it = iter(args)
+    for a in it:
+        if a == "--preset": preset = next(it)
+        elif a == "--layers": layers_file = next(it)
+        elif a == "--paper": paper = next(it).upper().replace("-", "_")
+        elif a == "--dpi": dpi = int(next(it))
+        elif a == "--ground": ground = next(it)
+        elif a == "--wash-opacity": wash = float(next(it))
+        elif a == "--structure": structure = next(it)
+        elif a == "--input": inp = next(it)
+        elif a == "--document": count = int(next(it))
+        elif a == "--title": title = next(it)
+        elif a == "--out": out = next(it)
+        elif a in ("-h", "--help"): print(page_cli.__doc__); return 0
+        else:
+            print(f"page: unknown argument {a!r}", file=sys.stderr); return 2
+    if preset:
+        p = load_presets()
+        if preset not in p["presets"]:
+            print(f"page: no preset named {preset!r}", file=sys.stderr); return 1
+        layers = p["presets"][preset]["layers"]
+    elif layers_file:
+        with open(layers_file) as f:
+            layers = json.load(f)
+        if isinstance(layers, dict): layers = layers.get("layers", [])
+    else:
+        print("page: give --preset NAME or --layers FILE", file=sys.stderr); return 2
+    data = None
+    if inp:
+        data = sys.stdin.buffer.read() if inp == "-" else open(inp, "rb").read()
+    try:
+        spec = build_page_spec(layers, paper, dpi, ground, wash, structure, data, preset)
+    except (ValueError, RuntimeError) as e:
+        print(f"page: {e}", file=sys.stderr); return 1
+    if count:
+        if paper not in PAPER_TRIM:
+            print(f"page: {paper} has no print trim; use LETTER, A5 or HALF_LETTER for --document", file=sys.stderr); return 1
+        spec = {"version": 1, "trim": PAPER_TRIM[paper], "includeBleed": True,
+                "meta": {"title": title or preset or "Layerbooth notebook"},
+                "pages": [{"template": spec, "count": count}]}
+    text = json.dumps(spec)
+    if out and out != "-":
+        with open(out, "w") as f: f.write(text)
+        print(f"wrote {out} ({len(text)//1024} KiB)", file=sys.stderr)
+    else:
+        sys.stdout.write(text); sys.stdout.flush()
+    return 0
+
 # ---------------------------------------------------------------- main
 def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
@@ -1360,6 +1499,8 @@ if __name__ == "__main__":
         sys.exit(0)
     if args and args[0] == "render":
         sys.exit(render_cli(args[1:]))
+    if args and args[0] == "page":
+        sys.exit(page_cli(args[1:]))
     if "--list" in args:
         p = load_presets()
         for n, v in sorted(p["presets"].items()):

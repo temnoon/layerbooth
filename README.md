@@ -96,6 +96,27 @@ Image and warp layers reference assets by absolute path. A preset file from
 `~/.config/layerbooth/presets.json` also works as `--layers`, its `layers` key
 is used.
 
+### Notebook pages for gravity-press
+
+A look can become a writing surface. `layerbooth page` renders the layer
+stack at paper size and wraps it as a gravity-press **PageSpec v1**: the
+rendered look is the page's Ground (an `image`, or a faint `wash`), and an
+optional ruling is added as Structure on top.
+
+```
+layerbooth page --preset "Prime 97 parchment" --paper A5 --structure dots --out page.json
+layerbooth page --layers examples/prime-relief.json --paper LETTER --ground wash --wash-opacity 0.15 --structure lines --out page.json
+layerbooth page --preset "Prime 97 parchment" --paper A5 --document 64 --title "Prime 97 notebook" --out notebook.json
+```
+
+- `--paper` is `LETTER`, `A4`, `A5` or `HALF_LETTER`; `--dpi` (default 150) sets the ground's pixel size.
+- `--ground image` (default) uses the look at full strength; `--ground wash` keeps it faint under handwriting.
+- `--structure` adds `lines`, `dots`, `grid` or `polar` with the renderer's defaults, or `none`.
+- `--input` supplies a photo for camera layers; without it they are blank, which is what a pattern-only page wants.
+- `--document COUNT` writes a **DocumentSpec** instead: one template page repeated COUNT times, with the Lulu trim that matches the paper (A4 has no trim).
+
+The output includes a `layerbooth` key with the original layer stack so the page can be reopened here; gravity-press's parser drops it.
+
 ## Hyprland
 
 The panel is a Chromium app window whose app id is derived from its URL, so a
