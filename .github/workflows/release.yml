@@ -30,9 +30,18 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
+      # The workflow and nfpm.yaml come from the commit that runs; the packaged
+      # files come from the tag, so older tags can be packaged by hand too.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Export the tagged sources
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          mkdir -p src
+          git archive "$TAG" | tar x -C src
+          ls src
 
       - name: Install nfpm and rpm tools
         run: |
@@ -47,8 +56,8 @@ jobs:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           mkdir -p dist
-          nfpm package --config nfpm.yaml --packager deb --target dist/
-          nfpm package --config nfpm.yaml --packager rpm --target dist/
+          (cd src && nfpm package --config ../nfpm.yaml --packager deb --target ../dist/)
+          (cd src && nfpm package --config ../nfpm.yaml --packager rpm --target ../dist/)
           ls -l dist
 
       - name: Inspect packages
