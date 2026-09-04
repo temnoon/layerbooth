@@ -40,11 +40,34 @@ layerbooth --apply "Borg"       # apply a named preset
 
 - **Camera** — every V4L2 control the driver offers, live. Double-click a
   slider to return it to its default.
-- **Layers** — a stack drawn bottom to top. Sources: the camera, an edge
-  detector (threshold, thickness, smoothing, colour, background, invert), a
-  solid colour, or a two-colour gradient with independent alpha per end. Each
-  layer has a blend mode, opacity, and an optional alpha mask that fades it
-  along a linear or radial gradient.
+- **Layers** — a stack drawn bottom to top. Each layer has a blend mode,
+  opacity, and an optional alpha mask that fades it along a linear or radial
+  gradient. Sources:
+  - **Camera** — the live feed.
+  - **Image / SVG** — a JPEG, PNG, WebP, GIF or SVG from a file on disk, an
+    upload (copied into `~/.config/layerbooth/assets/`), or a URL. Fit
+    (contain, cover, stretch, tile), scale, position, rotation. For SVGs the
+    stroke colour and stroke width can be overridden so a line drawing can be
+    recoloured to match a look. The **Prime…** button fetches one of the six
+    prime-number patterns from [fractal-core](https://fractal-core.com)
+    (tree, spiral, mandala, walk, burst, wave) for any prime.
+  - **Warp** — uses the geometry of an image or SVG (the *field*, rasterised
+    and blurred into a height map) to push the pixels of either the camera or
+    everything composited below it:
+    | effect | what the geometry does |
+    |---|---|
+    | displace | pixels slide along the strokes' gradient, the photo bulges around the drawing |
+    | refract | the drawing becomes glass over the photo, with highlights on the slopes |
+    | emboss | the strokes become lit relief; light angle and height are adjustable |
+    | contour | topographic isolines of the height field, in a chosen colour |
+    | chroma | red and blue split apart along the geometry |
+    | flow | the photo smears along the tangents of the strokes, like brushed metal |
+    | kaleidoscope | folds the source into n sectors around a centre (no field needed) |
+    | 3D tilt | rotates the plane in perspective (no field needed) |
+  - **Edges** — a GPU Sobel detector (threshold, thickness, smoothing, colour,
+    background, invert).
+  - **Colour** and **Gradient** — a solid fill, or two colours with independent
+    alpha per end, linear at any angle or radial.
 - **Presets** — a name holds the camera settings and the layer stack together.
   Click to load; the name fills the field so **Update** overwrites it; type a
   new name to save a copy. Star one to have it applied at login.
@@ -65,7 +88,11 @@ or `--format jpg|webp` with `--quality 0–1`, to `--out` or stdout, at the
 input's own resolution. Rendering runs the panel's own compositor in a headless
 Chromium, so the output is identical to what the panel shows.
 
-A layers file is a JSON array; `examples/` has a few. A preset file from
+A layers file is a JSON array; `examples/` has a few, including
+`prime-relief.json` which needs a fractal-core SVG on disk (fetch one with the
+panel's Prime… button, or `curl` it from
+`https://api.fractal-core.com/api/v1/svg?n=97&mode=mandala&background=none`).
+Image and warp layers reference assets by absolute path. A preset file from
 `~/.config/layerbooth/presets.json` also works as `--layers`, its `layers` key
 is used.
 

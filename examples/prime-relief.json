@@ -1,0 +1,9 @@
+[
+  {"type": "camera", "enabled": true, "opacity": 1, "blend": "source-over"},
+  {"type": "warp", "enabled": true, "opacity": 1, "blend": "source-over",
+   "source": "below", "path": "/home/you/.config/layerbooth/assets/prime-97-mandala.svg",
+   "fit": "contain", "blur": 4, "effect": "emboss", "strength": 0.7, "p1": 0.15, "p2": 0.4, "p3": 0.9},
+  {"type": "image", "enabled": true, "opacity": 0.5, "blend": "screen",
+   "path": "/home/you/.config/layerbooth/assets/prime-97-mandala.svg",
+   "fit": "contain", "scale": 1, "x": 0.5, "y": 0.5, "rotate": 0, "stroke": "#ffd166", "strokeScale": 1.5}
+]

@@ -1,0 +1,6 @@
+[
+  {"type": "camera", "enabled": true, "opacity": 1, "blend": "source-over"},
+  {"type": "warp", "enabled": true, "opacity": 1, "blend": "source-over",
+   "source": "below", "path": "/home/you/.config/layerbooth/assets/prime-97-burst.svg",
+   "fit": "contain", "blur": 5, "effect": "refract", "strength": 0.7, "p1": 0.8, "color": "#ffffff"}
+]

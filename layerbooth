@@ -77,6 +77,76 @@ def native_mjpeg(device):
     out = subprocess.run(["v4l2-ctl", "-d", device, "--list-formats"], capture_output=True, text=True).stdout
     return "'MJPG'" in out
 
+# ---------------------------------------------------------------- assets (images and SVGs for layers)
+ASSET_EXTS = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+              ".gif": "image/gif", ".svg": "image/svg+xml"}
+ASSET_ROOTS = [os.path.expanduser("~"), "/usr/share", "/tmp", os.environ.get("XDG_RUNTIME_DIR") or "/nonexistent"]
+
+def assets_dir():
+    d = os.path.join(CONFIG_DIR, "assets")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def asset_ok(path):
+    """Only image files, only under the user's home or shared data dirs."""
+    real = os.path.realpath(os.path.expanduser(path or ""))
+    ext = os.path.splitext(real)[1].lower()
+    if ext not in ASSET_EXTS or not os.path.isfile(real):
+        return None
+    if not any(real == r or real.startswith(r.rstrip("/") + "/") for r in ASSET_ROOTS):
+        return None
+    return real
+
+def serve_asset(handler, path):
+    real = asset_ok(path)
+    if not real:
+        return handler.send_error(404, "No such asset")
+    with open(real, "rb") as f:
+        body = f.read()
+    handler.send_response(200)
+    handler.send_header("Content-Type", ASSET_EXTS[os.path.splitext(real)[1].lower()])
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+def store_asset(data, name, ext):
+    import hashlib
+    ext = ext.lower()
+    if ext not in ASSET_EXTS:
+        raise ValueError("unsupported file type")
+    stem = safe_name(os.path.splitext(name or "asset")[0])[:60]
+    digest = hashlib.sha256(data).hexdigest()[:10]
+    path = os.path.join(assets_dir(), f"{stem}-{digest}{ext}")
+    if not os.path.exists(path):
+        with open(path, "wb") as f:
+            f.write(data)
+    return path
+
+def fetch_asset(url):
+    """Download an image or SVG over http(s) into the assets folder."""
+    import urllib.request, urllib.parse
+    u = urllib.parse.urlparse(url)
+    if u.scheme not in ("http", "https"):
+        raise ValueError("only http(s) URLs")
+    req = urllib.request.Request(url, headers={"User-Agent": "layerbooth/0.2", "Accept": "image/svg+xml,image/*"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        data = r.read(MAX_ASSET_BODY + 1)
+    if len(data) > MAX_ASSET_BODY:
+        raise ValueError("file too large")
+    by_type = {v: k for k, v in ASSET_EXTS.items()}
+    ext = by_type.get(ctype) or os.path.splitext(u.path)[1].lower()
+    if ext not in ASSET_EXTS:
+        if data.lstrip()[:5] in (b"<?xml", b"<svg ") or b"<svg" in data[:2000]:
+            ext = ".svg"
+        else:
+            raise ValueError(f"not an image ({ctype or 'unknown type'})")
+    name = os.path.basename(u.path) or "download"
+    if u.query:
+        name += "-" + safe_name(u.query)[:40]
+    return store_asset(data, name, ext)
+
 # ---------------------------------------------------------------- v4l2 helpers
 CTRL_RE = re.compile(r"^\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)$")
 MENU_RE = re.compile(r"^\s+(\d+):\s*(.*)$")
@@ -262,6 +332,7 @@ class Streamer:
 # ---------------------------------------------------------------- request guard
 MAX_JSON_BODY = 1 << 20        # 1 MiB of JSON is plenty for a layer stack
 MAX_IMAGE_BODY = 64 << 20      # composited snapshot / render result
+MAX_ASSET_BODY = 32 << 20      # uploaded or fetched layer asset
 
 class Guarded(BaseHTTPRequestHandler):
     """Every request must carry the per-run token, come from our own origin, and
@@ -342,7 +413,10 @@ class Handler(Guarded):
         elif u.path == "/stream":
             self._stream()
         elif u.path == "/state":
-            self._json({"device": DEVICE, "controls": list_controls(), "presets": load_presets()})
+            self._json({"device": DEVICE, "controls": list_controls(), "presets": load_presets(),
+                        "assets_dir": assets_dir()})
+        elif u.path == "/asset":
+            serve_asset(self, (parse_qs(u.query).get("path") or [""])[0])
         else:
             self.send_error(404)
 
@@ -440,6 +514,29 @@ class Handler(Guarded):
             os.makedirs(folder, exist_ok=True)
             subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._json({"ok": True})
+        elif u.path == "/asset/upload":
+            data = self.read_body(MAX_ASSET_BODY)
+            if data is None:
+                return
+            name = unquote(self.headers.get("X-Filename", "upload"))
+            try:
+                path = store_asset(data, name, os.path.splitext(name)[1])
+            except ValueError as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
+            self._json({"ok": True, "path": path})
+        elif u.path == "/asset/fetch":
+            url = (self._body().get("url") or "").strip()
+            try:
+                path = fetch_asset(url)
+            except Exception as e:
+                return self._json({"ok": False, "error": f"Fetch failed: {e}"}, 400)
+            self._json({"ok": True, "path": path})
+        elif u.path == "/asset/text":
+            real = asset_ok(self._body().get("path"))
+            if not real or not real.lower().endswith(".svg"):
+                return self._json({"ok": False, "error": "Not an SVG asset"}, 404)
+            with open(real, "r", encoding="utf-8", errors="replace") as f:
+                self._json({"ok": True, "svg": f.read(MAX_ASSET_BODY)})
         elif u.path == "/quit":
             self._json({"ok": True})
             threading.Thread(target=self.server_ref.shutdown, daemon=True).start()
@@ -486,11 +583,29 @@ LAYER_DEF = r"""function defaultLayer(type){
   if(type==='edges') Object.assign(base,{threshold:0.2,thickness:1,smooth:1.5,color:'#ffffff',bg:'transparent',invert:false});
   if(type==='color') Object.assign(base,{color:'#000000'});
   if(type==='gradient') Object.assign(base,{color:'#000000',color2:'#ffffff',alpha1:1,alpha2:1,angle:90,shape:'linear'});
+  if(type==='image') Object.assign(base,{path:'',fit:'contain',scale:1,x:0.5,y:0.5,rotate:0,stroke:'',strokeScale:1});
+  if(type==='warp') Object.assign(base,{source:'below',path:'',fit:'contain',blur:6,effect:'displace',strength:0.5,p1:0.5,p2:0.5,p3:0.5,color:'#ffffff'});
   return base;
 }
 """
 
-RENDER_CORE = r"""/* ---------------- rendering: WebGL Sobel + 2D compositor ---------------- */
+RENDER_CORE = r"""/* ---------------- assets: pick, fetch, prime patterns ---------------- */
+async function setAsset(L,path){L.path=path; L._open=true; renderLayers(); say('Asset: '+path.split('/').pop())}
+function pickFile(L){
+  const inp=document.createElement('input'); inp.type='file'; inp.accept='.svg,.png,.jpg,.jpeg,.webp,.gif,image/*';
+  inp.onchange=async()=>{const f=inp.files[0]; if(!f)return;
+    const r=await fetch('/asset/upload',{method:'POST',headers:{'X-Token':TOKEN,'X-Filename':encodeURIComponent(f.name),'Content-Type':'application/octet-stream'},body:f}).then(r=>r.json());
+    if(r.ok) setAsset(L,r.path); else say(r.error)};
+  inp.click();
+}
+async function fetchAsset(L,url){say('Fetching…'); const r=await post('/asset/fetch',{url}); if(r.ok) setAsset(L,r.path); else say(r.error)}
+async function primeAsset(L){
+  const n=prompt('Prime (or any number; the next prime is used)', '97'); if(!n) return;
+  const mode=prompt('Mode: tree, spiral, mandala, walk, burst, wave', 'mandala'); if(!mode) return;
+  const color=prompt('Colour scheme: prime, fire, ice, mono, rainbow', 'mono')||'mono';
+  fetchAsset(L,`https://api.fractal-core.com/api/v1/svg?n=${encodeURIComponent(n.trim())}&mode=${encodeURIComponent(mode.trim())}&color=${encodeURIComponent(color.trim())}&background=none`);
+}
+/* ---------------- rendering: WebGL Sobel + 2D compositor ---------------- */
 const cam=$('#cam'), out=$('#out'), ctx=out.getContext('2d');
 const tmp=document.createElement('canvas'); tmp.width=W; tmp.height=H; const tctx=tmp.getContext('2d');
 const glc=document.createElement('canvas'); glc.width=W; glc.height=H;
@@ -520,11 +635,134 @@ if(gl){
   for(const n of ['px','thr','thick','sm','col','mode','inv']) uni[n]=gl.getUniformLocation(prog,n);
   gl.uniform2f(uni.px,1/W,1/H);
 }
+/* ---- warp program: geometry-driven effects ---- */
+let wprog=null,wuni={},wtexSrc=null,wtexFld=null;
+if(gl){
+  const wvs=`attribute vec2 p;varying vec2 v;uniform mat4 m;void main(){v=vec2(p.x*.5+.5,p.y*.5+.5);gl_Position=m*vec4(p,0.,1.);}`;
+  const wfs=`precision highp float;varying vec2 v;uniform sampler2D src,fld;uniform vec2 px;uniform int effect;uniform float strength,p1,p2,p3;uniform vec3 col;
+  float h(vec2 q){vec4 c=texture2D(fld,q);return dot(c.rgb,vec3(.299,.587,.114));}
+  vec2 grad(vec2 q){float e=1.5;return vec2(h(q+vec2(px.x*e,0.))-h(q-vec2(px.x*e,0.)),h(q+vec2(0.,px.y*e))-h(q-vec2(0.,px.y*e)));}
+  void main(){
+    vec2 q=v; vec4 c;
+    if(effect==0){ // displace: push pixels along the field gradient, p1 biases toward a fixed direction
+      vec2 g=grad(q); q+=g*strength*4.0+vec2((p1-.5)*h(q)*0.3,0.); c=texture2D(src,q);}
+    else if(effect==1){ // refract: glass over the source, highlights on steep slopes
+      vec2 g=grad(q); q+=g*strength*3.0; c=texture2D(src,q); float spec=pow(clamp(length(g)*30.,0.,1.),1.5)*p1; c.rgb=mix(c.rgb,col,spec);}
+    else if(effect==2){ // emboss: field as height map, lit from an angle
+      vec2 g=grad(q); vec3 n=normalize(vec3(-g*strength*60.,1.)); float a=p1*6.2831853; vec3 l=normalize(vec3(cos(a),sin(a),0.2+p2*2.)); float d=max(dot(n,l),0.); c=texture2D(src,v); float shade=mix(1.,d*1.5,p3); c.rgb*=shade;}
+    else if(effect==3){ // contour: isolines of the height field
+      float hh=h(q); float k=2.+p1*40.; float f=fract(hh*k); float w=0.02+strength*0.25; float line=(1.-smoothstep(0.,w,f))+smoothstep(1.-w,1.,f); float m=step(0.01,hh); c=texture2D(src,v); c.rgb=mix(c.rgb,col,clamp(line*m,0.,1.));}
+    else if(effect==4){ // chroma: split channels along the gradient
+      vec2 g=grad(q)*strength*4.0; c=vec4(texture2D(src,q+g).r,texture2D(src,q).g,texture2D(src,q-g).b,1.);}
+    else if(effect==5){ // flow: smear along the tangent of the strokes
+      vec2 g=grad(q); vec2 t=length(g)>1e-5?normalize(vec2(-g.y,g.x)):vec2(0.); float n=4.+floor(p1*28.); vec4 acc=vec4(0.); float tot=0.;
+      for(int i=-16;i<=16;i++){ if(abs(float(i))>n) continue; float w=1.-abs(float(i))/(n+1.); acc+=texture2D(src,q+t*px*float(i)*strength*6.)*w; tot+=w;} c=acc/tot;}
+    else if(effect==6){ // kaleidoscope: fold the source into n sectors
+      vec2 ctr=vec2(p2,1.-p3); vec2 d=(q-ctr)/px; float r=length(d); float a=atan(d.y,d.x); float n=max(2.,floor(2.+p1*22.)); float sec=6.2831853/n; a=mod(a+strength*6.2831853,sec); if(a>sec*.5) a=sec-a; vec2 nd=vec2(cos(a),sin(a))*r; c=texture2D(src,ctr+nd*px);}
+    else { c=texture2D(src,v); } // tilt: handled in the vertex shader
+    gl_FragColor=c;
+  }`;
+  const sh=(t,src)=>{const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));return s};
+  wprog=gl.createProgram(); gl.attachShader(wprog,sh(gl.VERTEX_SHADER,wvs)); gl.attachShader(wprog,sh(gl.FRAGMENT_SHADER,wfs)); gl.linkProgram(wprog);
+  const mk=()=>{const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR); return t};
+  wtexSrc=mk(); wtexFld=mk();
+  for(const n of ['src','fld','px','effect','strength','p1','p2','p3','col','m']) wuni[n]=gl.getUniformLocation(wprog,n);
+}
+function tiltMatrix(tx,ty,persp,spin){ // column-major mat4: rotate the plane in 3D, perspective via w
+  const rx=(tx-0.5)*Math.PI*0.8, ry=(ty-0.5)*Math.PI*0.8, rz=(spin-0.5)*Math.PI*2, f=0.6+persp*3;
+  const mul=(A,B)=>A.map((row,i)=>[0,1,2].map(j=>row[0]*B[0][j]+row[1]*B[1][j]+row[2]*B[2][j]));
+  const c=Math.cos,si=Math.sin;
+  const Rx=[[1,0,0],[0,c(rx),-si(rx)],[0,si(rx),c(rx)]], Ry=[[c(ry),0,si(ry)],[0,1,0],[-si(ry),0,c(ry)]], Rz=[[c(rz),-si(rz),0],[si(rz),c(rz),0],[0,0,1]];
+  const R=mul(Rz,mul(Ry,Rx)); const asp=W/H;
+  // world = (x, y/asp); clip = (wx, wy*asp); w = 1 - wz/f
+  return new Float32Array([R[0][0], R[1][0]*asp, 0, -R[2][0]/f,   R[0][1]/asp, R[1][1], 0, -R[2][1]/(f*asp),   0,0,0,0,   0,0,0,1]);
+}
+const ident=new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+
+/* ---- asset cache: images and SVGs (with optional stroke recolour) ---- */
+const assetCache=new Map();
+function assetImage(path,stroke,strokeScale){
+  const key=path+'|'+(stroke||'')+'|'+(strokeScale||1);
+  let e=assetCache.get(key);
+  if(e) return e.img && e.img.complete && e.img.naturalWidth ? e.img : null;
+  e={img:null,ready:null}; assetCache.set(key,e);
+  const img=new Image();
+  e.ready=new Promise(res=>{img.onload=()=>res(true); img.onerror=()=>res(false)});
+  const url='/asset?t='+encodeURIComponent(TOKEN)+'&path='+encodeURIComponent(path);
+  if(path.toLowerCase().endsWith('.svg') && (stroke || (strokeScale&&strokeScale!==1))){
+    fetch('/asset/text',{method:'POST',headers:{'Content-Type':'application/json','X-Token':TOKEN},body:JSON.stringify({path})}).then(r=>r.json()).then(r=>{
+      if(!r.ok) return;
+      const doc=new DOMParser().parseFromString(r.svg,'image/svg+xml');
+      doc.querySelectorAll('*').forEach(el=>{
+        if(stroke){ if(el.getAttribute('stroke') && el.getAttribute('stroke')!=='none') el.setAttribute('stroke',stroke);
+                    if(el.getAttribute('fill') && el.getAttribute('fill')!=='none' && el.tagName!=='svg' && el.tagName!=='rect') el.setAttribute('fill',stroke); }
+        if(strokeScale && strokeScale!==1 && el.getAttribute('stroke-width')) el.setAttribute('stroke-width', String(parseFloat(el.getAttribute('stroke-width'))*strokeScale));
+      });
+      const blob=new Blob([new XMLSerializer().serializeToString(doc)],{type:'image/svg+xml'});
+      img.src=URL.createObjectURL(blob);
+    });
+  } else img.src=url;
+  e.img=img; return null;
+}
+async function preloadAssets(){ // headless render: wait for every referenced asset before compositing
+  const waits=[];
+  for(const L of layers){ if(!L.path) continue;
+    assetImage(L.path, L.type==='image'?L.stroke:'', L.type==='image'?L.strokeScale:1);
+    if(L.type==='warp') assetImage(L.path,'',1);
+    for(const [k,e] of assetCache) if(k.startsWith(L.path+'|')) waits.push(e.ready);
+  }
+  await Promise.all(waits);
+}
+function drawFitted(c2,img,L){ // fit/scale/offset/rotate an image onto a W×H canvas
+  const iw=img.naturalWidth||img.width||W, ih=img.naturalHeight||img.height||H;
+  const fit=L.fit||'contain', sc=(L.scale||1);
+  let w,hh;
+  if(fit==='stretch'){w=W;hh=H} else if(fit==='cover'){const k=Math.max(W/iw,H/ih);w=iw*k;hh=ih*k} else {const k=Math.min(W/iw,H/ih);w=iw*k;hh=ih*k}
+  w*=sc; hh*=sc;
+  const cx=(L.x??0.5)*W, cy=(L.y??0.5)*H;
+  c2.save(); c2.translate(cx,cy); c2.rotate((L.rotate||0)*Math.PI/180);
+  if(fit==='tile'){ const th=Math.max(1,(H*0.5*sc)|0), tw=Math.max(1,(th*iw/ih)|0); // one tile = half the frame height at scale 1
+    const off=document.createElement('canvas'); off.width=tw; off.height=th; off.getContext('2d').drawImage(img,0,0,tw,th);
+    c2.fillStyle=c2.createPattern(off,'repeat'); c2.fillRect(-W*2,-H*2,W*4,H*4); }
+  else c2.drawImage(img,-w/2,-hh/2,w,hh);
+  c2.restore();
+}
+/* ---- field rasteriser for warps: asset → blurred luminance on black ---- */
+const fieldCache=new Map();
+function fieldCanvas(L){
+  const img=assetImage(L.path,'',1); if(!img) return null;
+  const key=[L.path,L.fit,L.blur,L.scale||1,L.x??0.5,L.y??0.5,L.rotate||0,W,H].join('|');
+  let e=fieldCache.get(L.id); if(e && e.key===key) return e.canvas;
+  const c=document.createElement('canvas'); c.width=W; c.height=H; const c2=c.getContext('2d');
+  c2.fillStyle='#000'; c2.fillRect(0,0,W,H);
+  c2.filter=(L.blur>0)?`blur(${L.blur}px)`:'none';
+  drawFitted(c2,img,L);
+  c2.filter='none';
+  fieldCache.set(L.id,{key,canvas:c}); return c;
+}
+function renderWarp(L,srcEl){
+  if(!gl||!wprog) return null;
+  const isField=!['kaleido','tilt'].includes(L.effect);
+  const fld=isField?fieldCanvas(L):null;
+  if(isField && !fld) return null;
+  gl.useProgram(wprog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,wtexSrc); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,srcEl);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,wtexFld); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,fld||srcEl);
+  gl.uniform1i(wuni.src,0); gl.uniform1i(wuni.fld,1); gl.uniform2f(wuni.px,1/W,1/H);
+  const idx={displace:0,refract:1,emboss:2,contour:3,chroma:4,flow:5,kaleido:6,tilt:7}[L.effect]??0;
+  gl.uniform1i(wuni.effect,idx); gl.uniform1f(wuni.strength,L.strength); gl.uniform1f(wuni.p1,L.p1); gl.uniform1f(wuni.p2,L.p2); gl.uniform1f(wuni.p3,L.p3);
+  gl.uniform3fv(wuni.col,hex(L.color||'#ffffff'));
+  gl.uniformMatrix4fv(wuni.m,false,L.effect==='tilt'?tiltMatrix(L.strength,L.p1,L.p2,L.p3):ident);
+  gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  gl.useProgram(prog); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex);
+  return glc;
+}
 const hex=h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)/255);
 const rgba=(h,a)=>{const [r,g,b]=hex(h).map(x=>Math.round(x*255));return `rgba(${r},${g},${b},${a})`};
 let camUploaded=false;
 function renderEdges(L){
   if(!gl) return null;
+  gl.useProgram(prog); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex);
   if(!camUploaded){gl.bindTexture(gl.TEXTURE_2D,tex); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,cam); camUploaded=true}
   gl.uniform1f(uni.thr,L.threshold); gl.uniform1f(uni.thick,L.thickness); gl.uniform1f(uni.sm,L.smooth); gl.uniform3fv(uni.col,hex(L.color));
   gl.uniform1i(uni.mode,L.bg==='transparent'?0:L.bg==='black'?1:2); gl.uniform1i(uni.inv,L.invert?1:0);
@@ -541,6 +779,8 @@ function drawSource(L){
   if(L.type==='camera'){ tctx.drawImage(cam,0,0,W,H); }
   else if(L.type==='edges'){ const g=renderEdges(L); if(g) tctx.drawImage(g,0,0); }
   else if(L.type==='color'){ tctx.fillStyle=L.color; tctx.fillRect(0,0,W,H); }
+  else if(L.type==='image'){ if(L.path){ const img=assetImage(L.path,L.stroke,L.strokeScale); if(img) drawFitted(tctx,img,L); } }
+  else if(L.type==='warp'){ const srcEl=L.source==='camera'?cam:out; const g=renderWarp(L,srcEl); if(g) tctx.drawImage(g,0,0); }
   else if(L.type==='gradient'){
     let g;
     if(L.shape==='radial'){ g=tctx.createRadialGradient(W/2,H/2,0,W/2,H/2,Math.hypot(W,H)/2); }
@@ -564,7 +804,8 @@ function drawSource(L){
 }
 function setSize(w,h){
   W=w; H=h; for(const c of [out,tmp,glc]){c.width=W; c.height=H}
-  if(gl){gl.viewport(0,0,W,H); gl.uniform2f(uni.px,1/W,1/H)}
+  if(gl){gl.viewport(0,0,W,H); gl.useProgram(prog); gl.uniform2f(uni.px,1/W,1/H)}
+  fieldCache.clear();
 }
 function composite(){
   camUploaded=false;
@@ -583,7 +824,10 @@ LOAD_LAYERS = r"""function loadLayers(ls){
   layers=ls.map(L=>{const d=defaultLayer(TYPE_NAME[L.type]?L.type:'camera'); const m={...d.mask,...(L.mask||{})}; const out={...d,...L,id:uid++,mask:m};
     if(!BLENDS.includes(out.blend)) out.blend='source-over';
     for(const k of ['color','color2']) if(out[k]!==undefined && !okColor(out[k])) out[k]=d[k]||'#000000';
-    for(const k of ['opacity','threshold','thickness','smooth','alpha1','alpha2','angle']) if(out[k]!==undefined) out[k]=Number(out[k])||0;
+    for(const k of ['opacity','threshold','thickness','smooth','alpha1','alpha2','angle','scale','x','y','rotate','strokeScale','blur','strength','p1','p2','p3']) if(out[k]!==undefined) out[k]=Number(out[k])||0;
+    if(out.type==='warp' && !EFFECTS[out.effect]) out.effect='displace';
+    if(out.path!==undefined) out.path=String(out.path);
+    if(out.stroke!==undefined && out.stroke!=='' && !okColor(out.stroke)) out.stroke='';
     return out});
   renderLayers();
 }
@@ -660,7 +904,7 @@ input[type=color]{width:36px;height:24px;padding:0;border:1px solid var(--muted)
   <div class="row"><button onclick="resetAll()">Reset camera defaults</button></div>
 
   <h2>Layers <span class="spacer"></span>
-    <select id="addtype"><option value="camera">Camera</option><option value="edges">Edges</option><option value="color">Colour</option><option value="gradient">Gradient</option></select>
+    <select id="addtype"><option value="camera">Camera</option><option value="image">Image / SVG</option><option value="warp">Warp (geometry effect)</option><option value="edges">Edges</option><option value="color">Colour</option><option value="gradient">Gradient</option></select>
     <button class="icon" onclick="addLayer()">+ Add</button></h2>
   <div id="layers"></div>
   <div class="status">Top of the list is drawn on top. Masks carve each layer's alpha with a gradient.</div>
@@ -725,7 +969,11 @@ let uid=1;
 function addLayer(){layers.push(defaultLayer($('#addtype').value)); renderLayers()}
 function moveLayer(i,d){const j=i+d; if(j<0||j>=layers.length)return; [layers[i],layers[j]]=[layers[j],layers[i]]; renderLayers()}
 function removeLayer(i){layers.splice(i,1); renderLayers()}
-const TYPE_NAME={camera:'Camera',edges:'Edges',color:'Colour',gradient:'Gradient'};
+const TYPE_NAME={camera:'Camera',edges:'Edges',color:'Colour',gradient:'Gradient',image:'Image',warp:'Warp'};
+const EFFECTS={displace:'Displace',refract:'Refract (glass)',emboss:'Emboss (relief)',contour:'Contour lines',chroma:'Chroma split',flow:'Flow (smear along strokes)',kaleido:'Kaleidoscope',tilt:'3D tilt'};
+const EFFECT_PARAMS={ // labels for strength,p1,p2,p3 per effect
+  displace:['Strength','Direction bias','',''], refract:['Strength','Highlight','',''], emboss:['Height','Light angle','Light height','Mix'],
+  contour:['Line weight','Line count','',''], chroma:['Strength','','',''], flow:['Length','Taps','',''], kaleido:['Rotation','Folds','Centre X','Centre Y'], tilt:['Tilt X','Tilt Y','Perspective','Spin']};
 function range(label,key,min,max,step,obj,fmt){
   const v=obj[key]; const id='r'+Math.random().toString(36).slice(2);
   return `<label>${esc(label)}</label><div class="ctl"><span class="val" id="${id}v">${esc(fmt?fmt(v):v)}</span><input type="range" id="${id}" min="${+min}" max="${+max}" step="${+step}" value="${+v}" data-key="${esc(key)}"></div>`;
@@ -748,6 +996,31 @@ function renderLayers(){
       <label>Background</label><select data-key="bg"><option value="transparent" ${L.bg==='transparent'?'selected':''}>transparent</option><option value="black" ${L.bg==='black'?'selected':''}>black</option><option value="camera" ${L.bg==='camera'?'selected':''}>camera image</option></select>
       <label>Invert</label><input type="checkbox" data-key="invert" ${L.invert?'checked':''}>`;
     if(L.type==='color') body+=`<label>Colour</label><div class="row"><input type="color" data-key="color" value="${esc(L.color)}"></div>`;
+    const assetRow=(label)=>`<label>${label}</label><div class="row"><input type="text" data-key="path" value="${esc(L.path)}" placeholder="path to .svg .png .jpg" style="flex:1;min-width:0"></div>
+      <span></span><div class="row"><button class="icon act-upload">Upload…</button><button class="icon act-url">URL…</button><button class="icon act-prime">Prime…</button></div>`;
+    if(L.type==='image') body+=`
+      ${assetRow('File')}
+      <label>Fit</label><select data-key="fit">${['contain','cover','stretch','tile'].map(f=>`<option value="${f}" ${L.fit===f?'selected':''}>${f}</option>`).join('')}</select>
+      ${range('Scale','scale',0.05,4,0.01,L)}
+      ${range('Position X','x',0,1,0.01,L)}
+      ${range('Position Y','y',0,1,0.01,L)}
+      ${range('Rotate','rotate',-180,180,1,L,v=>v+'°')}
+      <label>SVG stroke</label><div class="row"><input type="color" data-key="stroke" value="${esc(L.stroke||'#ffffff')}"><button class="icon act-nostroke" title="Use the SVG's own colours">own colours</button></div>
+      ${range('Stroke width','strokeScale',0.1,8,0.1,L,v=>v+'×')}`;
+    if(L.type==='warp'){
+      const lab=EFFECT_PARAMS[L.effect]||EFFECT_PARAMS.displace;
+      body+=`
+      <label>Source</label><select data-key="source"><option value="below" ${L.source==='below'?'selected':''}>everything below</option><option value="camera" ${L.source==='camera'?'selected':''}>camera</option></select>
+      <label>Effect</label><select data-key="effect">${Object.entries(EFFECTS).map(([k,v])=>`<option value="${k}" ${L.effect===k?'selected':''}>${v}</option>`).join('')}</select>
+      ${['kaleido','tilt'].includes(L.effect)?'':assetRow('Field')}
+      ${['kaleido','tilt'].includes(L.effect)?'':`<label>Field fit</label><select data-key="fit">${['contain','cover','stretch','tile'].map(f=>`<option value="${f}" ${L.fit===f?'selected':''}>${f}</option>`).join('')}</select>`}
+      ${['kaleido','tilt'].includes(L.effect)?'':range('Field blur','blur',0,40,0.5,L,v=>v+'px')}
+      ${range(lab[0]||'Strength','strength',0,1,0.005,L)}
+      ${lab[1]?range(lab[1],'p1',0,1,0.005,L):''}
+      ${lab[2]?range(lab[2],'p2',0,1,0.005,L):''}
+      ${lab[3]?range(lab[3],'p3',0,1,0.005,L):''}
+      ${['contour','refract'].includes(L.effect)?`<label>Colour</label><div class="row"><input type="color" data-key="color" value="${esc(L.color)}"></div>`:''}`;
+    }
     if(L.type==='gradient') body+=`
       <label>Shape</label><select data-key="shape"><option value="linear" ${L.shape==='linear'?'selected':''}>linear</option><option value="radial" ${L.shape==='radial'?'selected':''}>radial</option></select>
       <label>Colour A</label><div class="row"><input type="color" data-key="color" value="${esc(L.color)}"></div>
@@ -773,6 +1046,12 @@ function renderLayers(){
     down.onclick=e=>{e.preventDefault();e.stopPropagation();moveLayer(i,-1)};
     del.onclick=e=>{e.preventDefault();e.stopPropagation();removeLayer(i)};
     d.ontoggle=()=>{L._open=d.open};
+    const bUp=d.querySelector('.act-upload'), bUrl=d.querySelector('.act-url'), bPrime=d.querySelector('.act-prime'), bOwn=d.querySelector('.act-nostroke');
+    if(bUp) bUp.onclick=e=>{e.preventDefault(); pickFile(L)};
+    if(bUrl) bUrl.onclick=e=>{e.preventDefault(); const u=prompt('Image or SVG URL'); if(u) fetchAsset(L,u)};
+    if(bPrime) bPrime.onclick=e=>{e.preventDefault(); primeAsset(L)};
+    if(bOwn) bOwn.onclick=e=>{e.preventDefault(); L.stroke=''; L._open=true; renderLayers()};
+    const effSel=d.querySelector('select[data-key=effect]'); if(effSel) effSel.addEventListener('change',()=>{L._open=true; renderLayers()});
     d.querySelectorAll('[data-key]').forEach(el=>{
       const apply=()=>{
         let v = el.type==='checkbox'?el.checked : el.type==='range'?+el.value : el.value;
@@ -852,7 +1131,8 @@ const TOKEN='/*TOKEN*/';
 $('#cam').src='/input?t='+encodeURIComponent(TOKEN);
 let W=1280,H=720; let uid=1;
 const BLENDS=['source-over','multiply','screen','overlay','darken','lighten','color-dodge','color-burn','hard-light','soft-light','difference','exclusion','hue','saturation','color','luminosity'];
-const TYPE_NAME={camera:'Camera',edges:'Edges',color:'Colour',gradient:'Gradient'};
+const TYPE_NAME={camera:'Camera',edges:'Edges',color:'Colour',gradient:'Gradient',image:'Image',warp:'Warp'};
+const EFFECTS={displace:1,refract:1,emboss:1,contour:1,chroma:1,flow:1,kaleido:1,tilt:1};
 /*LAYER_DEF*/
 let layers=[defaultLayer('camera')];
 function renderLayers(){}
@@ -862,6 +1142,7 @@ const FORMAT='/*FORMAT*/', QUALITY=/*QUALITY*/;
 async function go(){
   setSize(cam.naturalWidth, cam.naturalHeight);
   loadLayers(/*LAYERS_JSON*/);
+  await preloadAssets();
   composite();
   const blob=await new Promise(res=>out.toBlob(res, FORMAT, QUALITY));
   const r=await fetch('/render-result',{method:'POST',headers:{'Content-Type':FORMAT,'X-Token':TOKEN},body:blob});
@@ -889,6 +1170,8 @@ class RenderHandler(Guarded):
                     .replace("/*FORMAT*/", self.fmt).replace("/*QUALITY*/", str(float(self.quality)))
                     .replace("/*TOKEN*/", self.token)).encode()
             ctype = "text/html; charset=utf-8"
+        elif path == "/asset":
+            return serve_asset(self, (parse_qs(urlparse(self.path).query).get("path") or [""])[0])
         elif path == "/input":
             body, ctype = self.input_bytes, self.input_type
         else:
@@ -900,6 +1183,16 @@ class RenderHandler(Guarded):
         self.wfile.write(body)
 
     def do_POST(self):
+        if urlparse(self.path).path == "/asset/text":
+            raw = self.read_body(MAX_JSON_BODY) or b"{}"
+            try:
+                real = asset_ok(json.loads(raw).get("path"))
+            except (ValueError, AttributeError):
+                real = None
+            body = json.dumps({"ok": bool(real), "svg": open(real, encoding="utf-8", errors="replace").read() if real else ""}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            return
         data = self.read_body(MAX_IMAGE_BODY)
         if data is None:
             return
@@ -974,7 +1267,7 @@ def render_cli(args):
     httpd = ThreadingHTTPServer(("127.0.0.1", port), RenderHandler)
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    with tempfile.TemporaryDirectory(prefix="layerbooth-render-", dir=os.environ.get("XDG_RUNTIME_DIR")) as profile:
+    with tempfile.TemporaryDirectory(prefix="layerbooth-render-", dir=os.environ.get("XDG_RUNTIME_DIR"), ignore_cleanup_errors=True) as profile:
         proc = subprocess.Popen([browser, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
                                  "--disable-extensions", f"--user-data-dir={profile}", "--window-size=1280,720",
                                  f"http://127.0.0.1:{port}/render?t={RenderHandler.token}"],
