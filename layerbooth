@@ -1554,7 +1554,39 @@ def cli_apply(name):
     print(f"Applied preset {name!r}" if ok else f"Failed: {err}", file=sys.stderr)
     return 0 if ok else 1
 
+def instance_file():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or CONFIG_DIR, "layerbooth.instance")
+
+def running_instance():
+    """PID of a live panel server started by this user, or None."""
+    try:
+        with open(instance_file()) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+def focus_existing():
+    """Raise the open panel window instead of starting a second camera server."""
+    import shutil
+    if shutil.which("hyprctl"):
+        try:
+            clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True).stdout)
+            for c in clients:
+                if "__layerbooth" in c.get("class", ""):
+                    subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{c["address"]}" }})'],
+                                   capture_output=True)
+                    return True
+        except (ValueError, KeyError):
+            pass
+    return False
+
 def serve():
+    if running_instance():
+        if not focus_existing():
+            print("layerbooth is already running", file=sys.stderr)
+        return
     port = free_port()
     Handler.token = secrets.token_urlsafe(32)
     Handler.port = port
@@ -1589,9 +1621,18 @@ def serve():
     threading.Thread(target=idle_watch, daemon=True).start()
     signal.signal(signal.SIGTERM, lambda *a: threading.Thread(target=httpd.shutdown).start())
     try:
+        with open(instance_file(), "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    try:
         httpd.serve_forever()
     finally:
         Handler.streamer.stop()
+        try:
+            os.unlink(instance_file())
+        except OSError:
+            pass
 
 if __name__ == "__main__":
     args = sys.argv[1:]
