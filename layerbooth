@@ -8,6 +8,9 @@ Works with any V4L2 camera. Runs on Omarchy out of the box and on any other
 Wayland/X11 desktop that has Python 3, ffmpeg, v4l-utils and a Chromium-based
 browser.
 
+Environment:
+  LAYERBOOTH_CONFIG_DIR      where presets.json lives (default ~/.config/layerbooth)
+
 Usage:
   layerbooth                 open the panel (server + browser app window)
   layerbooth --apply         apply the preset marked "apply at login"
@@ -25,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, unquote
 
 DEVICE = None  # resolved by detect_device() unless --device is given
-CONFIG_DIR = os.path.expanduser("~/.config/layerbooth")
+CONFIG_DIR = os.environ.get("LAYERBOOTH_CONFIG_DIR") or os.path.expanduser("~/.config/layerbooth")
 PRESETS_FILE = os.path.join(CONFIG_DIR, "presets.json")
 PICTURES = os.path.expanduser("~/Pictures")
 IDLE_EXIT_SECONDS = 20
