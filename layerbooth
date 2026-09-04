@@ -1357,7 +1357,7 @@ def build_page_spec(layers, paper="LETTER", dpi=150, ground="image", wash_opacit
     png = render_headless(input_bytes, layers)
     image_cfg = {"version": 1, "type": "image", "paper": paper,
                  "src": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
-                 "fit": "cover", "offsetX": 0, "offsetY": 0, "imageWidth": w, "imageHeight": h}
+                 "fit": "cover", "offsetX": 0, "offsetY": 0}  # imageWidth/Height are page inches; default = full page
     if ground == "wash":
         g = {"kind": "wash", "config": image_cfg, "opacity": max(0.02, min(0.5, float(wash_opacity)))}
     else:
