@@ -1,0 +1,63 @@
+# nfpm builds the .deb and .rpm from this one file (https://nfpm.goreleaser.com).
+# VERSION comes from the release tag in .github/workflows/release.yml, e.g. v0.1.0 -> 0.1.0.
+name: layerbooth
+arch: all
+platform: linux
+version: ${VERSION}
+release: "1"
+section: graphics
+priority: optional
+maintainer: Tem Noon <tem@temnoon.com>
+vendor: Tem Noon
+homepage: https://github.com/temnoon/layerbooth
+license: MIT
+description: |
+  Photobooth with layers.
+  Live V4L2 camera controls next to a layer stack: SVG and image layers,
+  GPU edge detection, gradients, blend modes, alpha masks, and warp effects
+  driven by vector geometry. Named presets, snapshot templates, a stdin/stdout
+  render CLI, and export of looks as gravity-press notebook pages.
+
+contents:
+  - src: ./layerbooth
+    dst: /usr/bin/layerbooth
+    file_info:
+      mode: 0755
+  - src: ./layerbooth.desktop
+    dst: /usr/share/applications/layerbooth.desktop
+  - src: ./README.md
+    dst: /usr/share/doc/layerbooth/README.md
+  - src: ./LICENSE
+    dst: /usr/share/doc/layerbooth/LICENSE
+  - src: ./contrib/hyprland.lua
+    dst: /usr/share/doc/layerbooth/hyprland.lua
+  - src: ./examples/
+    dst: /usr/share/doc/layerbooth/examples/
+  - src: ./docs/notebook-builder-integration.md
+    dst: /usr/share/doc/layerbooth/notebook-builder-integration.md
+
+overrides:
+  deb:
+    depends:
+      - python3 (>= 3.10)
+      - ffmpeg
+      - v4l-utils
+    recommends:
+      - chromium | chromium-browser | google-chrome-stable
+      - libnotify-bin
+  rpm:
+    depends:
+      - python3 >= 3.10
+      - ffmpeg
+      - v4l-utils
+    recommends:
+      - chromium
+      - libnotify
+
+deb:
+  # Debian expects the license text at this path.
+  fields:
+    Bugs: https://github.com/temnoon/layerbooth/issues
+rpm:
+  summary: Photobooth with layers
+  group: Applications/Multimedia
