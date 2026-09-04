@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""Layerbooth — camera control panel with a layered effects stack.
+
+Live preview of a V4L2 camera with sliders for every control the driver
+exposes, snapshots, and named presets that can be re-applied at login.
+
+Works with any V4L2 camera. Runs on Omarchy out of the box and on any other
+Wayland/X11 desktop that has Python 3, ffmpeg, v4l-utils and a Chromium-based
+browser.
+
+Usage:
+  layerbooth                 open the panel (server + browser app window)
+  layerbooth --apply         apply the preset marked "apply at login"
+  layerbooth --apply NAME    apply a named preset
+  layerbooth --list          list presets
+  layerbooth --devices              list capture devices
+  layerbooth --device /dev/videoN ...
+  layerbooth render [--preset NAME | --layers FILE] [--format png|jpg|webp]
+                              [--quality 0-1] [--out FILE] [INPUT|-]
+                                       apply a layer stack to an image: reads INPUT (or stdin),
+                                       writes the composited image to --out (or stdout)
+"""
+import json, os, re, signal, socket, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse, unquote
+
+DEVICE = None  # resolved by detect_device() unless --device is given
+CONFIG_DIR = os.path.expanduser("~/.config/layerbooth")
+PRESETS_FILE = os.path.join(CONFIG_DIR, "presets.json")
+PICTURES = os.path.expanduser("~/Pictures")
+IDLE_EXIT_SECONDS = 20
+BOUNDARY = "omarchyframe"
+
+# ---------------------------------------------------------------- device discovery
+def capture_capable(device):
+    out = subprocess.run(["v4l2-ctl", "-d", device, "--info"], capture_output=True, text=True).stdout
+    caps = out.split("Device Caps", 1)[-1] if "Device Caps" in out else ""
+    return "Video Capture" in caps
+
+def list_devices():
+    """[(path, name)] for every V4L2 node that can capture video, first is the default."""
+    devices = []
+    which = __import__("shutil").which
+    if which("omarchy-capture-webcam-list"):
+        out = subprocess.run(["omarchy-capture-webcam-list"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.split(None, 1)
+            if parts and parts[0].startswith("/dev/video"):
+                devices.append((parts[0], parts[1].rstrip(":") if len(parts) > 1 else parts[0]))
+        if devices:
+            return devices
+    out = subprocess.run(["v4l2-ctl", "--list-devices"], capture_output=True, text=True).stdout
+    name, seen = "", set()
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            name = line.rstrip(":")
+        elif line.strip().startswith("/dev/video"):
+            dev = line.strip()
+            if name not in seen and capture_capable(dev):
+                seen.add(name)
+                devices.append((dev, name))
+    if not devices:
+        for i in range(10):
+            dev = f"/dev/video{i}"
+            if os.path.exists(dev) and capture_capable(dev):
+                devices.append((dev, dev))
+    return devices
+
+def detect_device():
+    devices = list_devices()
+    return devices[0][0] if devices else "/dev/video0"
+
+def native_mjpeg(device):
+    out = subprocess.run(["v4l2-ctl", "-d", device, "--list-formats"], capture_output=True, text=True).stdout
+    return "'MJPG'" in out
+
+# ---------------------------------------------------------------- v4l2 helpers
+CTRL_RE = re.compile(r"^\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)$")
+MENU_RE = re.compile(r"^\s+(\d+):\s*(.*)$")
+
+def list_controls(device=None):
+    device = device or DEVICE
+    out = subprocess.run(["v4l2-ctl", "-d", device, "--list-ctrls-menus"],
+                         capture_output=True, text=True).stdout
+    controls, current = [], None
+    for line in out.splitlines():
+        m = CTRL_RE.match(line)
+        if m:
+            name, typ, rest = m.groups()
+            attrs = dict(re.findall(r"(\w+)=(-?\w+)", rest))
+            current = {"name": name, "type": typ,
+                       "label": name.replace("_", " "),
+                       "min": int(attrs.get("min", 0)), "max": int(attrs.get("max", 1)),
+                       "step": int(attrs.get("step", 1)),
+                       "default": int(attrs.get("default", 0)),
+                       "value": int(attrs.get("value", 0)),
+                       "inactive": "inactive" in attrs.get("flags", ""),
+                       "menu": []}
+            controls.append(current)
+            continue
+        mm = MENU_RE.match(line)
+        if mm and current is not None and current["type"] in ("menu", "intmenu"):
+            current["menu"].append({"value": int(mm.group(1)), "label": mm.group(2)})
+    return controls
+
+def preset_controls(preset):
+    """Presets are {controls:{}, layers:[]}; older ones were a flat controls dict."""
+    if isinstance(preset, dict) and "controls" in preset:
+        return preset["controls"]
+    return preset
+
+def set_controls(values, device=None):
+    device = device or DEVICE
+    if not values:
+        return True, ""
+    arg = ",".join(f"{k}={int(v)}" for k, v in values.items())
+    r = subprocess.run(["v4l2-ctl", "-d", device, "--set-ctrl", arg],
+                       capture_output=True, text=True)
+    return r.returncode == 0, r.stderr.strip()
+
+# ---------------------------------------------------------------- presets
+DEFAULT_SETTINGS = {"folder": "~/Pictures", "template": "camera-[datetime]"}
+DEFAULT_LAYER = {"type": "camera", "enabled": True, "opacity": 1, "blend": "source-over"}
+TOKENS = ["[preset]", "[date]", "[time]", "[datetime]", "[n]"]
+
+def load_presets():
+    try:
+        with open(PRESETS_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("presets", {})
+    data.setdefault("login", None)
+    data["settings"] = {**DEFAULT_SETTINGS, **(data.get("settings") or {})}
+    for name, preset in list(data["presets"].items()):
+        if not isinstance(preset, dict) or "controls" not in preset:
+            preset = {"controls": preset, "layers": []}
+        if not preset.get("layers"):
+            preset["layers"] = [DEFAULT_LAYER]
+        data["presets"][name] = preset
+    return data
+
+def safe_name(text):
+    text = re.sub(r"[/\\:*?\"<>|\x00-\x1f]+", "-", str(text)).strip(" .")
+    return text or "untitled"
+
+def snapshot_path(settings, preset, ext, create=True):
+    """Expand the filename template. [n] is the lowest counter that doesn't collide."""
+    folder = os.path.expanduser(settings.get("folder") or DEFAULT_SETTINGS["folder"])
+    template = settings.get("template") or DEFAULT_SETTINGS["template"]
+    now = time.localtime()
+    name = template
+    name = name.replace("[preset]", safe_name(preset) if preset else "untitled")
+    name = name.replace("[date]", time.strftime("%Y-%m-%d", now))
+    name = name.replace("[time]", time.strftime("%H-%M-%S", now))
+    name = name.replace("[datetime]", time.strftime("%Y%m%d-%H%M%S", now))
+    name = safe_name(name) if "/" not in name else name  # allow sub-folders in the template
+    if not name.lower().endswith(ext):
+        name += ext
+    if create:
+        os.makedirs(os.path.dirname(os.path.join(folder, name)), exist_ok=True)
+    if "[n]" in name:
+        for i in range(1, 100000):
+            candidate = os.path.join(folder, name.replace("[n]", f"{i:03d}"))
+            if not os.path.exists(candidate):
+                return candidate
+    path = os.path.join(folder, name)
+    if os.path.exists(path):  # never overwrite: append a counter
+        stem, e = os.path.splitext(path)
+        i = 2
+        while os.path.exists(f"{stem}-{i}{e}"):
+            i += 1
+        path = f"{stem}-{i}{e}"
+    return path
+
+def save_presets(data):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = PRESETS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, PRESETS_FILE)
+
+# ---------------------------------------------------------------- theme
+def theme_colors():
+    """Read the active Omarchy theme's colors.toml (flat key = "#hex" file)."""
+    colors = {}
+    try:
+        name = subprocess.run(["omarchy-theme-current"], capture_output=True, text=True).stdout.strip()
+        d = subprocess.run(["omarchy-theme-dir", name], capture_output=True, text=True).stdout.strip()
+        with open(os.path.join(d, "colors.toml")) as f:
+            for line in f:
+                m = re.match(r'^\s*(\w+)\s*=\s*"(#[0-9a-fA-F]{6})"', line)
+                if m:
+                    colors[m.group(1)] = m.group(2)
+    except Exception:
+        pass
+    return colors
+
+# ---------------------------------------------------------------- streamer
+class Streamer:
+    """One ffmpeg process reading the camera; frames fanned out to clients."""
+    def __init__(self, device):
+        self.device = device
+        self.proc = None
+        self.lock = threading.Condition()
+        self.frame = None
+        self.seq = 0
+        self.clients = 0
+        self.last_client = time.time()
+
+    def start(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        if native_mjpeg(self.device):
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "v4l2", "-input_format", "mjpeg",
+                   "-i", self.device, "-c:v", "copy", "-f", "mpjpeg", "-"]
+        else:
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "v4l2",
+                   "-i", self.device, "-f", "mpjpeg", "-q:v", "4", "-"]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        out = self.proc.stdout
+        while True:
+            # ffmpeg mpjpeg: boundary, headers, blank line, body
+            length = None
+            while True:
+                line = out.readline()
+                if not line:
+                    return
+                if line.lower().startswith(b"content-length:"):
+                    length = int(line.split(b":")[1])
+                if line in (b"\r\n", b"\n") and length is not None:
+                    break
+            body = out.read(length)
+            if len(body) < length:
+                return
+            with self.lock:
+                self.frame = body
+                self.seq += 1
+                self.lock.notify_all()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+    def next_frame(self, seen):
+        with self.lock:
+            self.lock.wait_for(lambda: self.seq != seen, timeout=2)
+            return self.frame, self.seq
+
+# ---------------------------------------------------------------- web
+class Handler(BaseHTTPRequestHandler):
+    streamer: Streamer = None
+    colors: dict = {}
+    server_ref = None
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path in ("/", "/layerbooth"):
+            body = PAGE.replace("/*THEME*/", theme_css(self.colors)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif u.path == "/stream":
+            self._stream()
+        elif u.path == "/state":
+            self._json({"device": DEVICE, "controls": list_controls(), "presets": load_presets()})
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        p = load_presets()
+        if u.path == "/set":
+            ok, err = set_controls(self._body())
+            self._json({"ok": ok, "error": err, "controls": list_controls()})
+        elif u.path == "/reset":
+            defaults = {c["name"]: c["default"] for c in list_controls()}
+            set_controls(defaults)
+            self._json({"ok": True, "controls": list_controls()})
+        elif u.path == "/preset/save":
+            b = self._body()
+            name = (b.get("name") or "").strip()
+            if not name:
+                return self._json({"ok": False, "error": "Preset needs a name"}, 400)
+            p["presets"][name] = {"controls": {c["name"]: c["value"] for c in list_controls()},
+                                  "layers": b.get("layers") or []}
+            save_presets(p)
+            self._json({"ok": True, "presets": p})
+        elif u.path == "/preset/apply":
+            name = self._body().get("name")
+            preset = p["presets"].get(name)
+            if preset is None:
+                return self._json({"ok": False, "error": "No such preset"}, 404)
+            ok, err = set_controls(preset_controls(preset))
+            layers = preset.get("layers") if isinstance(preset, dict) else None
+            self._json({"ok": ok, "error": err, "controls": list_controls(), "layers": layers or [DEFAULT_LAYER]})
+        elif u.path == "/preset/delete":
+            name = self._body().get("name")
+            p["presets"].pop(name, None)
+            if p["login"] == name:
+                p["login"] = None
+            save_presets(p)
+            self._json({"ok": True, "presets": p})
+        elif u.path == "/preset/login":
+            name = self._body().get("name")
+            p["login"] = name if name in p["presets"] else None
+            save_presets(p)
+            self._json({"ok": True, "presets": p})
+        elif u.path == "/snapshot":
+            preset = unquote(self.headers.get("X-Preset", ""))
+            if self.headers.get("Content-Type", "").startswith("image/png"):
+                # composited frame rendered by the page
+                n = int(self.headers.get("Content-Length", 0))
+                frame = self.rfile.read(n)
+                ext = ".png"
+            else:
+                frame, _ = self.streamer.next_frame(-1)
+                if not frame:
+                    return self._json({"ok": False, "error": "No frame yet"}, 503)
+                ext = ".jpg"
+            try:
+                path = snapshot_path(p["settings"], preset, ext)
+                with open(path, "wb") as f:
+                    f.write(frame)
+            except OSError as e:
+                return self._json({"ok": False, "error": f"Cannot write snapshot: {e}"}, 500)
+            notifier = "omarchy-notification-send" if __import__("shutil").which("omarchy-notification-send") else "notify-send"
+            subprocess.Popen([notifier, "-i", "camera-photo", "Snapshot saved", path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._json({"ok": True, "path": path})
+        elif u.path == "/settings":
+            b = self._body()
+            folder = (b.get("folder") or "").strip() or DEFAULT_SETTINGS["folder"]
+            template = (b.get("template") or "").strip() or DEFAULT_SETTINGS["template"]
+            settings = {"folder": folder, "template": template}
+            try:
+                example = os.path.relpath(snapshot_path(settings, b.get("preset") or "", ".png", create=False),
+                                          os.path.expanduser(folder))
+                os.makedirs(os.path.expanduser(folder), exist_ok=True)
+                if not os.access(os.path.expanduser(folder), os.W_OK):
+                    raise OSError("folder is not writable")
+            except OSError as e:
+                return self._json({"ok": False, "error": f"Snapshot folder problem: {e}"}, 400)
+            p["settings"] = settings
+            save_presets(p)
+            self._json({"ok": True, "settings": p["settings"], "example": example})
+        elif u.path == "/open-folder":
+            folder = os.path.expanduser(p["settings"]["folder"])
+            os.makedirs(folder, exist_ok=True)
+            subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._json({"ok": True})
+        elif u.path == "/quit":
+            self._json({"ok": True})
+            threading.Thread(target=self.server_ref.shutdown, daemon=True).start()
+        else:
+            self.send_error(404)
+
+    def _stream(self):
+        s = self.streamer
+        s.start()
+        s.clients += 1
+        self.send_response(200)
+        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        seen = -1
+        try:
+            while True:
+                frame, seen = s.next_frame(seen)
+                if frame is None:
+                    continue
+                self.wfile.write(f"--{BOUNDARY}\r\nContent-Type: image/jpeg\r\n"
+                                 f"Content-Length: {len(frame)}\r\n\r\n".encode())
+                self.wfile.write(frame)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            s.clients -= 1
+            s.last_client = time.time()
+
+def theme_css(c):
+    def g(k, d): return c.get(k, d)
+    return f"""
+    --bg: {g('background', '#1e1e2e')}; --bg2: {g('dark_background', '#171723')};
+    --bg3: {g('lighter_background', '#353543')}; --fg: {g('foreground', '#cdd6f4')};
+    --fg2: {g('dark_foreground', '#9aa1b7')}; --accent: {g('accent', '#89b4fa')};
+    --muted: {g('muted', '#45475a')}; --red: {g('red', '#f38ba8')}; --green: {g('green', '#a6e3a1')};
+    """
+
+LAYER_DEF = r"""function defaultLayer(type){
+  const base={id:uid++,type,enabled:true,opacity:1,blend:'source-over',
+    mask:{type:'none',angle:0,cx:0.5,cy:0.5,start:0.2,end:0.8,invert:false}};
+  if(type==='edges') Object.assign(base,{threshold:0.2,thickness:1,smooth:1.5,color:'#ffffff',bg:'transparent',invert:false});
+  if(type==='color') Object.assign(base,{color:'#000000'});
+  if(type==='gradient') Object.assign(base,{color:'#000000',color2:'#ffffff',alpha1:1,alpha2:1,angle:90,shape:'linear'});
+  return base;
+}
+"""
+
+RENDER_CORE = r"""/* ---------------- rendering: WebGL Sobel + 2D compositor ---------------- */
+const cam=$('#cam'), out=$('#out'), ctx=out.getContext('2d');
+const tmp=document.createElement('canvas'); tmp.width=W; tmp.height=H; const tctx=tmp.getContext('2d');
+const glc=document.createElement('canvas'); glc.width=W; glc.height=H;
+const gl=glc.getContext('webgl',{premultipliedAlpha:true,preserveDrawingBuffer:true});
+let prog=null,tex=null,uni={};
+if(gl){
+  const vs=`attribute vec2 p;varying vec2 v;void main(){v=vec2(p.x*.5+.5,p.y*.5+.5);gl_Position=vec4(p,0.,1.);}`;
+  const fs=`precision mediump float;varying vec2 v;uniform sampler2D u;uniform vec2 px;uniform float thr,thick,sm;uniform vec3 col;uniform int mode,inv;
+  float l1(vec2 q){vec3 c=texture2D(u,q).rgb;return dot(c,vec3(.299,.587,.114));}
+  float lum(vec2 o){vec2 q=v+o*px*thick; if(sm<=0.)return l1(q); vec2 d=px*sm; return (l1(q)*2.+l1(q+vec2(d.x,0.))+l1(q-vec2(d.x,0.))+l1(q+vec2(0.,d.y))+l1(q-vec2(0.,d.y))+l1(q+d)+l1(q-d)+l1(q+vec2(d.x,-d.y))+l1(q-vec2(d.x,-d.y)))/10.;}
+  void main(){
+    float tl=lum(vec2(-1.,-1.)),t=lum(vec2(0.,-1.)),tr=lum(vec2(1.,-1.)),l=lum(vec2(-1.,0.)),r=lum(vec2(1.,0.)),bl=lum(vec2(-1.,1.)),b=lum(vec2(0.,1.)),br=lum(vec2(1.,1.));
+    float gx=-tl-2.*l-bl+tr+2.*r+br; float gy=-tl-2.*t-tr+bl+2.*b+br;
+    float e=clamp(sqrt(gx*gx+gy*gy),0.,1.); e=smoothstep(thr,min(thr+.25,1.),e); if(inv==1)e=1.-e;
+    if(mode==0){gl_FragColor=vec4(col*e,e);}                       // edges on transparent (premultiplied)
+    else if(mode==1){gl_FragColor=vec4(col*e,1.);}                  // edges on black
+    else {vec3 c=texture2D(u,v).rgb; gl_FragColor=vec4(mix(c,col,e),1.);} // edges over camera
+  }`;
+  const sh=(t,src)=>{const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));return s};
+  prog=gl.createProgram(); gl.attachShader(prog,sh(gl.VERTEX_SHADER,vs)); gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,fs)); gl.linkProgram(prog); gl.useProgram(prog);
+  const buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  const p=gl.getAttribLocation(prog,'p'); gl.enableVertexAttribArray(p); gl.vertexAttribPointer(p,2,gl.FLOAT,false,0,0);
+  tex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  for(const n of ['px','thr','thick','sm','col','mode','inv']) uni[n]=gl.getUniformLocation(prog,n);
+  gl.uniform2f(uni.px,1/W,1/H);
+}
+const hex=h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)/255);
+const rgba=(h,a)=>{const [r,g,b]=hex(h).map(x=>Math.round(x*255));return `rgba(${r},${g},${b},${a})`};
+let camUploaded=false;
+function renderEdges(L){
+  if(!gl) return null;
+  if(!camUploaded){gl.bindTexture(gl.TEXTURE_2D,tex); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,cam); camUploaded=true}
+  gl.uniform1f(uni.thr,L.threshold); gl.uniform1f(uni.thick,L.thickness); gl.uniform1f(uni.sm,L.smooth); gl.uniform3fv(uni.col,hex(L.color));
+  gl.uniform1i(uni.mode,L.bg==='transparent'?0:L.bg==='black'?1:2); gl.uniform1i(uni.inv,L.invert?1:0);
+  gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  return glc;
+}
+function linearCoords(angleDeg){ // gradient line through centre; angle 0 = left→right, 90 = top→bottom
+  const a=angleDeg*Math.PI/180, dx=Math.cos(a), dy=Math.sin(a);
+  const len=Math.abs(dx)*W+Math.abs(dy)*H; // covers the whole frame
+  return [W/2-dx*len/2, H/2-dy*len/2, W/2+dx*len/2, H/2+dy*len/2];
+}
+function drawSource(L){
+  tctx.globalCompositeOperation='source-over'; tctx.globalAlpha=1; tctx.clearRect(0,0,W,H);
+  if(L.type==='camera'){ tctx.drawImage(cam,0,0,W,H); }
+  else if(L.type==='edges'){ const g=renderEdges(L); if(g) tctx.drawImage(g,0,0); }
+  else if(L.type==='color'){ tctx.fillStyle=L.color; tctx.fillRect(0,0,W,H); }
+  else if(L.type==='gradient'){
+    let g;
+    if(L.shape==='radial'){ g=tctx.createRadialGradient(W/2,H/2,0,W/2,H/2,Math.hypot(W,H)/2); }
+    else { g=tctx.createLinearGradient(...linearCoords(L.angle)); }
+    g.addColorStop(0,rgba(L.color,L.alpha1)); g.addColorStop(1,rgba(L.color2,L.alpha2));
+    tctx.fillStyle=g; tctx.fillRect(0,0,W,H);
+  }
+  const m=L.mask;
+  if(m.type!=='none'){
+    let g;
+    if(m.type==='radial'){ const r=Math.hypot(W,H)/2; g=tctx.createRadialGradient(m.cx*W,m.cy*H,0,m.cx*W,m.cy*H,r); }
+    else { g=tctx.createLinearGradient(...linearCoords(m.angle)); }
+    const s=Math.min(m.start,m.end), e=Math.max(m.start,m.end);
+    const a0=m.invert?0:1, a1=m.invert?1:0;
+    g.addColorStop(0,`rgba(0,0,0,${a0})`); g.addColorStop(s,`rgba(0,0,0,${a0})`);
+    if(e>s) g.addColorStop(e,`rgba(0,0,0,${a1})`); else g.addColorStop(Math.min(1,e+0.0001),`rgba(0,0,0,${a1})`);
+    g.addColorStop(1,`rgba(0,0,0,${a1})`);
+    tctx.globalCompositeOperation='destination-in'; tctx.fillStyle=g; tctx.fillRect(0,0,W,H);
+  }
+  return tmp;
+}
+function setSize(w,h){
+  W=w; H=h; for(const c of [out,tmp,glc]){c.width=W; c.height=H}
+  if(gl){gl.viewport(0,0,W,H); gl.uniform2f(uni.px,1/W,1/H)}
+}
+function composite(){
+  camUploaded=false;
+  ctx.globalCompositeOperation='source-over'; ctx.globalAlpha=1; ctx.clearRect(0,0,W,H);
+  for(const L of layers){
+    if(!L.enabled) continue;
+    const src=drawSource(L);
+    ctx.globalAlpha=L.opacity; ctx.globalCompositeOperation=L.blend; ctx.drawImage(src,0,0);
+  }
+}
+/*END_RENDER_CORE*/"""
+
+LOAD_LAYERS = r"""function loadLayers(ls){
+  if(!ls||!ls.length) ls=[{type:'camera'}];
+  layers=ls.map(L=>{const d=defaultLayer(L.type||'camera'); const m={...d.mask,...(L.mask||{})}; return {...d,...L,id:uid++,mask:m}});
+  renderLayers();
+}
+"""
+
+def assemble(template):
+    return (template.replace("/*LAYER_DEF*/", LAYER_DEF).replace("/*RENDER_CORE*/", RENDER_CORE)
+            .replace("/*LOAD_LAYERS*/", LOAD_LAYERS))
+
+PAGE = assemble(r"""<!doctype html><html><head><meta charset="utf-8"><title>Layerbooth</title>
+<style>
+:root{ /*THEME*/ }
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 system-ui,sans-serif;height:100vh;display:grid;grid-template-columns:1fr 380px;overflow:hidden}
+.view{display:flex;flex-direction:column;background:var(--bg2);min-width:0}
+.stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#000}
+canvas#out{max-width:100%;max-height:100%;object-fit:contain}
+canvas#out.mirror{transform:scaleX(-1)}
+.toolbar{display:flex;gap:8px;padding:10px;align-items:center;border-top:1px solid var(--bg3)}
+.toolbar .spacer{flex:1}
+aside{padding:12px;overflow:auto;border-left:1px solid var(--bg3);display:flex;flex-direction:column;gap:12px}
+h2{margin:14px 0 2px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--fg2);display:flex;align-items:center;gap:8px}
+h2 .spacer{flex:1}
+.ctl{display:grid;grid-template-columns:1fr auto;gap:0 8px;align-items:center}
+.ctl label{text-transform:capitalize}
+.ctl .val{font-variant-numeric:tabular-nums;color:var(--fg2);min-width:3ch;text-align:right}
+.ctl input[type=range]{grid-column:1/-1;width:100%;accent-color:var(--accent);margin:0 0 4px}
+.ctl.bool{grid-template-columns:auto 1fr}
+button,select,input[type=text]{background:var(--bg3);color:var(--fg);border:1px solid var(--muted);border-radius:6px;padding:5px 9px;font:inherit}
+button{cursor:pointer}button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600}
+button.icon{padding:2px 6px;font-size:12px;line-height:1}
+button.danger:hover{border-color:var(--red);color:var(--red)}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.row>input[type=text]{flex:1}
+.preset{display:flex;align-items:center;gap:6px;padding:3px 0}
+.preset .name{flex:1;cursor:pointer}.preset .name:hover{color:var(--accent)}
+.preset .login{color:var(--fg2);font-size:11px;cursor:pointer}
+.preset .login.on{color:var(--green)}
+.preset .x{color:var(--fg2);cursor:pointer;padding:0 4px}.preset .x:hover{color:var(--red)}
+.status{color:var(--fg2);font-size:12px;min-height:1.4em;line-height:1.35}
+.check{display:flex;align-items:center;gap:6px;color:var(--fg2)}
+details{border:1px solid var(--bg3);border-radius:8px;background:var(--bg2)}
+details>summary{list-style:none;cursor:pointer;padding:6px 8px;display:flex;align-items:center;gap:6px}
+details>summary::-webkit-details-marker{display:none}
+details[open]>summary{border-bottom:1px solid var(--bg3)}
+.layer-body{padding:8px;display:flex;flex-direction:column;gap:6px}
+.layer-body .grid{display:grid;grid-template-columns:auto 1fr;gap:4px 8px;align-items:center}
+.layer-body .grid label{color:var(--fg2)}
+.sw{width:14px;height:14px;border-radius:3px;border:1px solid var(--muted)}
+.lname{flex:1;font-weight:600}
+.dim{color:var(--fg2)}
+input[type=color]{width:36px;height:24px;padding:0;border:1px solid var(--muted);border-radius:4px;background:var(--bg3)}
+.sub{margin-top:4px;padding-top:6px;border-top:1px dashed var(--bg3)}
+.sub h3{margin:0 0 4px;font-size:11px;color:var(--fg2);text-transform:uppercase;letter-spacing:.06em}
+.grid2{display:grid;grid-template-columns:auto 1fr;gap:6px 8px;align-items:center}
+.grid2 label{color:var(--fg2)}
+.grid2 input[type=text]{width:100%}
+.preset .name.current{color:var(--accent);font-weight:600}
+</style></head><body>
+<div class="view">
+  <div class="stage"><canvas id="out" width="1280" height="720"></canvas></div>
+  <div class="toolbar">
+    <label class="check"><input type="checkbox" id="mirror" checked> Mirror preview</label>
+    <span class="spacer"></span>
+    <span class="status" id="status"></span>
+    <button class="primary" onclick="snap()">📷 Snapshot</button>
+    <button onclick="quit()">Close</button>
+  </div>
+</div>
+<aside>
+  <h2>Camera</h2>
+  <div id="controls"></div>
+  <div class="row"><button onclick="resetAll()">Reset camera defaults</button></div>
+
+  <h2>Layers <span class="spacer"></span>
+    <select id="addtype"><option value="camera">Camera</option><option value="edges">Edges</option><option value="color">Colour</option><option value="gradient">Gradient</option></select>
+    <button class="icon" onclick="addLayer()">+ Add</button></h2>
+  <div id="layers"></div>
+  <div class="status">Top of the list is drawn on top. Masks carve each layer's alpha with a gradient.</div>
+
+  <h2>Presets</h2>
+  <div id="presets"></div>
+  <div class="row"><input type="text" id="pname" placeholder="Preset name"><button class="primary" id="psave" onclick="savePreset()">Save</button></div>
+  <div class="status">Click a preset to load it; its name fills the field, so Update overwrites it. Type a new name to save a copy. ☆ marks the one applied at login.</div>
+
+  <h2>Snapshots</h2>
+  <div class="grid2">
+    <label>Folder</label><div class="row"><input type="text" id="sfolder" placeholder="~/Pictures"><button class="icon" onclick="openFolder()" title="Open folder">📂</button></div>
+    <label>Filename</label><input type="text" id="stemplate" placeholder="camera-[datetime]">
+  </div>
+  <div class="status">Tokens: [preset] [date] [time] [datetime] [n] &nbsp;·&nbsp; a / makes sub-folders &nbsp;·&nbsp; extension is added automatically</div>
+  <div class="row"><span class="status" id="sexample" style="flex:1"></span><button onclick="saveSettings()">Save settings</button></div>
+</aside>
+<img id="cam" src="/stream" alt="" hidden>
+<script>
+const $=s=>document.querySelector(s);
+let W=1280,H=720;
+let state={controls:[],presets:{presets:{},login:null,settings:{}}};
+let currentPreset='';
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json());
+const say=m=>{$('#status').textContent=m; setTimeout(()=>{if($('#status').textContent===m)$('#status').textContent=''},3000)};
+$('#mirror').onchange=e=>$('#out').classList.toggle('mirror',e.target.checked);
+$('#mirror').onchange({target:$('#mirror')});
+
+/* ---------------- camera (v4l2) controls ---------------- */
+function renderControls(){
+  const box=$('#controls'); box.innerHTML='';
+  for(const c of state.controls){
+    const d=document.createElement('div'); d.className='ctl'+(c.type==='bool'?' bool':'');
+    if(c.type==='bool'){
+      d.innerHTML=`<input type="checkbox" id="c_${c.name}" ${c.value?'checked':''} ${c.inactive?'disabled':''}><label for="c_${c.name}">${c.label}</label>`;
+      d.querySelector('input').onchange=e=>setCtl(c.name,e.target.checked?1:0);
+    }else if(c.menu&&c.menu.length){
+      d.innerHTML=`<label>${c.label}</label><span></span><select ${c.inactive?'disabled':''}>${c.menu.map(m=>`<option value="${m.value}" ${m.value===c.value?'selected':''}>${m.label}</option>`).join('')}</select>`;
+      d.querySelector('select').onchange=e=>setCtl(c.name,+e.target.value);
+    }else{
+      d.innerHTML=`<label>${c.label}</label><span class="val">${c.value}</span><input type="range" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.value}" ${c.inactive?'disabled':''}>`;
+      const r=d.querySelector('input'), v=d.querySelector('.val');
+      r.oninput=e=>{v.textContent=e.target.value; setCtl(c.name,+e.target.value,true)};
+      r.ondblclick=()=>{r.value=c.default; r.oninput({target:r})};
+    }
+    box.appendChild(d);
+  }
+}
+let pending={},timer=null;
+function setCtl(name,value,debounce){pending[name]=value; clearTimeout(timer); timer=setTimeout(flush,debounce?60:0)}
+async function flush(){const b=pending; pending={}; const r=await post('/set',b); if(!r.ok) say(r.error||'Failed to set control'); state.controls=r.controls}
+async function resetAll(){const r=await post('/reset'); state.controls=r.controls; renderControls(); say('Camera defaults restored')}
+
+/* ---------------- layers ---------------- */
+const BLENDS=['source-over','multiply','screen','overlay','darken','lighten','color-dodge','color-burn','hard-light','soft-light','difference','exclusion','hue','saturation','color','luminosity'];
+const BLEND_LABEL={'source-over':'normal'};
+let uid=1;
+/*LAYER_DEF*/let layers=[defaultLayer('camera')];   // bottom → top
+function addLayer(){layers.push(defaultLayer($('#addtype').value)); renderLayers()}
+function moveLayer(i,d){const j=i+d; if(j<0||j>=layers.length)return; [layers[i],layers[j]]=[layers[j],layers[i]]; renderLayers()}
+function removeLayer(i){layers.splice(i,1); renderLayers()}
+const TYPE_NAME={camera:'Camera',edges:'Edges',color:'Colour',gradient:'Gradient'};
+function range(label,key,min,max,step,obj,fmt){
+  const v=obj[key]; const id='r'+Math.random().toString(36).slice(2);
+  return `<label>${label}</label><div class="ctl"><span class="val" id="${id}v">${fmt?fmt(v):v}</span><input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${v}" data-key="${key}"></div>`;
+}
+function renderLayers(){
+  const box=$('#layers'); box.innerHTML='';
+  const openIds=new Set([...box.querySelectorAll('details[open]')].map(d=>+d.dataset.id));
+  // render top-most first
+  for(let i=layers.length-1;i>=0;i--){
+    const L=layers[i];
+    const d=document.createElement('details'); d.dataset.id=L.id; if(L._open) d.open=true;
+    let body=`<div class="grid">
+      <label>Blend</label><select data-key="blend">${BLENDS.map(b=>`<option value="${b}" ${b===L.blend?'selected':''}>${BLEND_LABEL[b]||b}</option>`).join('')}</select>
+      ${range('Opacity','opacity',0,1,0.01,L,v=>Math.round(v*100)+'%')}`;
+    if(L.type==='edges') body+=`
+      ${range('Threshold','threshold',0,1,0.01,L)}
+      ${range('Thickness','thickness',0.5,4,0.1,L)}
+      ${range('Smoothing','smooth',0,6,0.1,L)}
+      <label>Edge colour</label><div class="row"><input type="color" data-key="color" value="${L.color}"></div>
+      <label>Background</label><select data-key="bg"><option value="transparent" ${L.bg==='transparent'?'selected':''}>transparent</option><option value="black" ${L.bg==='black'?'selected':''}>black</option><option value="camera" ${L.bg==='camera'?'selected':''}>camera image</option></select>
+      <label>Invert</label><input type="checkbox" data-key="invert" ${L.invert?'checked':''}>`;
+    if(L.type==='color') body+=`<label>Colour</label><div class="row"><input type="color" data-key="color" value="${L.color}"></div>`;
+    if(L.type==='gradient') body+=`
+      <label>Shape</label><select data-key="shape"><option value="linear" ${L.shape==='linear'?'selected':''}>linear</option><option value="radial" ${L.shape==='radial'?'selected':''}>radial</option></select>
+      <label>Colour A</label><div class="row"><input type="color" data-key="color" value="${L.color}"></div>
+      ${range('Alpha A','alpha1',0,1,0.01,L,v=>Math.round(v*100)+'%')}
+      <label>Colour B</label><div class="row"><input type="color" data-key="color2" value="${L.color2}"></div>
+      ${range('Alpha B','alpha2',0,1,0.01,L,v=>Math.round(v*100)+'%')}
+      ${range('Angle','angle',0,360,1,L,v=>v+'°')}`;
+    body+=`</div><div class="sub"><h3>Alpha mask</h3><div class="grid">
+      <label>Type</label><select data-key="mask.type"><option value="none" ${L.mask.type==='none'?'selected':''}>none</option><option value="linear" ${L.mask.type==='linear'?'selected':''}>linear gradient</option><option value="radial" ${L.mask.type==='radial'?'selected':''}>radial gradient</option></select>
+      ${range('Angle','mask.angle',0,360,1,{['mask.angle']:L.mask.angle},v=>v+'°')}
+      ${range('Centre X','mask.cx',0,1,0.01,{['mask.cx']:L.mask.cx})}
+      ${range('Centre Y','mask.cy',0,1,0.01,{['mask.cy']:L.mask.cy})}
+      ${range('Opaque until','mask.start',0,1,0.01,{['mask.start']:L.mask.start})}
+      ${range('Clear after','mask.end',0,1,0.01,{['mask.end']:L.mask.end})}
+      <label>Invert</label><input type="checkbox" data-key="mask.invert" ${L.mask.invert?'checked':''}>
+    </div></div>`;
+    d.innerHTML=`<summary><input type="checkbox" ${L.enabled?'checked':''} data-key="enabled" title="Enable" onclick="event.stopPropagation()">
+      <span class="lname">${TYPE_NAME[L.type]}</span><span class="dim">${BLEND_LABEL[L.blend]||L.blend} · ${Math.round(L.opacity*100)}%</span>
+      <button class="icon" title="Move up (toward front)">▲</button><button class="icon" title="Move down">▼</button><button class="icon danger" title="Delete">✕</button></summary>
+      <div class="layer-body">${body}</div>`;
+    const [up,down,del]=d.querySelectorAll('summary button');
+    up.onclick=e=>{e.preventDefault();e.stopPropagation();moveLayer(i,+1)};
+    down.onclick=e=>{e.preventDefault();e.stopPropagation();moveLayer(i,-1)};
+    del.onclick=e=>{e.preventDefault();e.stopPropagation();removeLayer(i)};
+    d.ontoggle=()=>{L._open=d.open};
+    d.querySelectorAll('[data-key]').forEach(el=>{
+      const apply=()=>{
+        let v = el.type==='checkbox'?el.checked : el.type==='range'?+el.value : el.value;
+        const k=el.dataset.key;
+        if(k.startsWith('mask.')) L.mask[k.slice(5)]=v; else L[k]=v;
+        if(el.type==='range'){const s=document.getElementById(el.id+'v'); if(s){const key=k.split('.').pop(); s.textContent=(key==='opacity'||key.startsWith('alpha'))?Math.round(v*100)+'%':(key==='angle'?v+'°':v)}}
+        if(k==='blend'||k==='opacity'){d.querySelector('.dim').textContent=`${BLEND_LABEL[L.blend]||L.blend} · ${Math.round(L.opacity*100)}%`}
+      };
+      el.oninput=apply; el.onchange=apply;
+    });
+    box.appendChild(d);
+  }
+}
+
+/*RENDER_CORE*/
+function frame(){
+  requestAnimationFrame(frame);
+  if(!cam.complete||!cam.naturalWidth) return;
+  composite();
+}
+requestAnimationFrame(frame);
+
+/* ---------------- presets ---------------- */
+function cleanLayers(){return layers.map(({_open,...L})=>L)}
+/*LOAD_LAYERS*/function renderPresets(){
+  const box=$('#presets'); box.innerHTML='';
+  const names=Object.keys(state.presets.presets).sort();
+  if(!names.length){box.innerHTML='<div class="status">No presets yet. Adjust things, name it, Save.</div>';return}
+  for(const n of names){
+    const d=document.createElement('div'); d.className='preset';
+    const on=state.presets.login===n;
+    d.innerHTML=`<span class="name ${n===currentPreset?'current':''}">${n}</span><span class="login ${on?'on':''}" title="Apply this preset at login">${on?'★ login':'☆ login'}</span><span class="x" title="Delete">✕</span>`;
+    d.querySelector('.name').onclick=()=>applyPreset(n);
+    d.querySelector('.login').onclick=()=>setLogin(on?null:n);
+    d.querySelector('.x').onclick=()=>deletePreset(n);
+    box.appendChild(d);
+  }
+}
+async function applyPreset(n){const r=await post('/preset/apply',{name:n}); state.controls=r.controls; renderControls(); loadLayers(r.layers); if(r.ok){currentPreset=n; $('#pname').value=n; updateSaveButton(); renderPresets(); previewName()} say(r.ok?`Applied "${n}"`:r.error)}
+function updateSaveButton(){const n=$('#pname').value.trim(); const exists=n && state.presets.presets[n]!==undefined; $('#psave').textContent=exists?'Update':'Save'; $('#psave').title=exists?`Overwrite "${n}" with the current camera settings and layers`:'Save as a new preset'}
+$('#pname').oninput=updateSaveButton;
+$('#pname').onkeydown=e=>{if(e.key==='Enter')savePreset()};
+async function savePreset(){const n=$('#pname').value.trim(); if(!n){say('Preset needs a name');return}
+  const exists=state.presets.presets[n]!==undefined;
+  if(exists && !confirm(`Overwrite preset "${n}" with the current camera settings and layers?`)) return;
+  const r=await post('/preset/save',{name:n,layers:cleanLayers()}); if(r.ok){state.presets=r.presets; currentPreset=n; renderPresets(); previewName(); updateSaveButton(); say(exists?`Updated "${n}"`:`Saved "${n}"`)} else say(r.error)}
+async function deletePreset(n){if(!confirm(`Delete preset "${n}"?`))return; const r=await post('/preset/delete',{name:n}); state.presets=r.presets; if(currentPreset===n){currentPreset=''; $('#pname').value=''} renderPresets(); updateSaveButton()}
+async function setLogin(n){const r=await post('/preset/login',{name:n}); state.presets=r.presets; renderPresets(); say(n?`"${n}" will be applied at login`:'No preset at login')}
+async function snap(){
+  const blob=await new Promise(res=>out.toBlob(res,'image/png'));
+  const r=await fetch('/snapshot',{method:'POST',headers:{'Content-Type':'image/png','X-Preset':encodeURIComponent(currentPreset)},body:blob}).then(r=>r.json());
+  say(r.ok?'Saved '+r.path.split('/').pop():r.error);
+}
+/* ---------------- snapshot settings ---------------- */
+function loadSettings(){const st=state.presets.settings||{}; $('#sfolder').value=st.folder||'~/Pictures'; $('#stemplate').value=st.template||'camera-[datetime]'; previewName()}
+let ptimer=null;
+function previewName(){clearTimeout(ptimer); ptimer=setTimeout(async()=>{
+  // dry-run through the server so the example uses the exact same expansion; does not persist
+  const t=$('#stemplate').value.trim()||'camera-[datetime]';
+  const ex=t.replace('[preset]',currentPreset||'untitled').replace('[date]',new Date().toISOString().slice(0,10)).replace('[time]','HH-MM-SS').replace('[datetime]','YYYYMMDD-HHMMSS').replace('[n]','001');
+  $('#sexample').textContent='e.g. '+ex+'.png';
+},150)}
+$('#stemplate').oninput=previewName;
+async function saveSettings(){const r=await post('/settings',{folder:$('#sfolder').value,template:$('#stemplate').value,preset:currentPreset}); if(r.ok){state.presets.settings=r.settings; $('#sfolder').value=r.settings.folder; $('#stemplate').value=r.settings.template; $('#sexample').textContent='e.g. '+r.example; say('Snapshot settings saved')} else say(r.error)}
+async function openFolder(){await saveSettings(); post('/open-folder')}
+async function quit(){await post('/quit'); window.close(); document.body.innerHTML='<p style="padding:2em">Camera panel closed.</p>'}
+fetch('/state').then(r=>r.json()).then(s=>{state=s; renderControls(); renderPresets(); renderLayers(); loadSettings();
+  if(s.presets.login) applyPreset(s.presets.login); // open with the login look, layers included
+});
+</script></body></html>""")
+
+RENDER_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>render</title></head>
+<body style="margin:0;background:#000"><canvas id="out"></canvas><img id="cam" src="/input" alt="" hidden>
+<script>
+const $=s=>document.querySelector(s);
+let W=1280,H=720; let uid=1;
+/*LAYER_DEF*/
+let layers=[defaultLayer('camera')];
+function renderLayers(){}
+/*RENDER_CORE*/
+/*LOAD_LAYERS*/
+const FORMAT='/*FORMAT*/', QUALITY=/*QUALITY*/;
+async function go(){
+  setSize(cam.naturalWidth, cam.naturalHeight);
+  loadLayers(/*LAYERS_JSON*/);
+  composite();
+  const blob=await new Promise(res=>out.toBlob(res, FORMAT, QUALITY));
+  const r=await fetch('/render-result',{method:'POST',headers:{'Content-Type':FORMAT},body:blob});
+  document.title = r.ok ? 'done' : 'failed';
+}
+if(cam.complete&&cam.naturalWidth) go(); else cam.onload=go;
+cam.onerror=()=>fetch('/render-result',{method:'POST',headers:{'Content-Type':'text/plain'},body:'input image failed to decode'});
+</script></body></html>"""
+
+
+# ---------------------------------------------------------------- headless render (CLI)
+class RenderHandler(BaseHTTPRequestHandler):
+    input_bytes = b""
+    input_type = "image/jpeg"
+    layers = []
+    fmt = "image/png"
+    quality = 0.92
+    result = None
+    done = threading.Event()
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/render"):
+            body = (assemble(RENDER_PAGE).replace("/*LAYERS_JSON*/", json.dumps(self.layers))
+                    .replace("/*FORMAT*/", self.fmt).replace("/*QUALITY*/", str(self.quality))).encode()
+            ctype = "text/html; charset=utf-8"
+        elif self.path == "/input":
+            body, ctype = self.input_bytes, self.input_type
+        else:
+            return self.send_error(404)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        data = self.rfile.read(n)
+        if self.headers.get("Content-Type", "").startswith("text/plain"):
+            RenderHandler.result = ("error", data.decode(errors="replace"))
+        else:
+            RenderHandler.result = ("ok", data)
+        self.send_response(204); self.end_headers()
+        RenderHandler.done.set()
+
+def find_browser():
+    import shutil
+    for b in ("chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "brave", "helium"):
+        path = shutil.which(b)
+        if path:
+            return path
+    return None
+
+def sniff_type(data):
+    if data[:8] == b"\x89PNG\r\n\x1a\n": return "image/png"
+    if data[:3] == b"\xff\xd8\xff": return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP": return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"): return "image/gif"
+    return "image/jpeg"
+
+def render_cli(args):
+    """render [--preset NAME | --layers FILE] [--format png|jpg] [--quality Q] [--out FILE] [INPUT|-]"""
+    import tempfile
+    preset = layers_file = out = None
+    fmt, quality, inputs = "png", 0.92, []
+    it = iter(args)
+    for a in it:
+        if a == "--preset": preset = next(it)
+        elif a == "--layers": layers_file = next(it)
+        elif a == "--out": out = next(it)
+        elif a == "--format": fmt = next(it).lower().lstrip(".")
+        elif a == "--quality": quality = float(next(it))
+        elif a in ("-h", "--help"):
+            print(render_cli.__doc__); return 0
+        else: inputs.append(a)
+    if len(inputs) > 1:
+        print("render: one input at a time", file=sys.stderr); return 2
+    src = inputs[0] if inputs else "-"
+    data = sys.stdin.buffer.read() if src == "-" else open(src, "rb").read()
+    if not data:
+        print("render: no input image", file=sys.stderr); return 2
+    if preset:
+        p = load_presets()
+        if preset not in p["presets"]:
+            print(f"render: no preset named {preset!r}", file=sys.stderr); return 1
+        layers = p["presets"][preset]["layers"]
+    elif layers_file:
+        with open(layers_file) as f:
+            layers = json.load(f)
+        if isinstance(layers, dict): layers = layers.get("layers", [])
+    else:
+        layers = [DEFAULT_LAYER]
+    browser = find_browser()
+    if not browser:
+        print("render: needs a Chromium-based browser for headless rendering", file=sys.stderr); return 1
+
+    RenderHandler.input_bytes = data
+    RenderHandler.input_type = sniff_type(data)
+    RenderHandler.layers = layers
+    RenderHandler.fmt = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(fmt, "image/png")
+    RenderHandler.quality = max(0.0, min(1.0, quality))
+    RenderHandler.result = None
+    RenderHandler.done.clear()
+    port = free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), RenderHandler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    with tempfile.TemporaryDirectory(prefix="layerbooth-render-", dir=os.environ.get("XDG_RUNTIME_DIR")) as profile:
+        proc = subprocess.Popen([browser, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                                 "--disable-extensions", f"--user-data-dir={profile}", "--window-size=1280,720",
+                                 f"http://127.0.0.1:{port}/render"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ok = RenderHandler.done.wait(60)
+        proc.terminate()
+        try: proc.wait(5)
+        except subprocess.TimeoutExpired: proc.kill()
+    httpd.shutdown()
+    if not ok or RenderHandler.result is None:
+        print("render: browser produced no output within 60s", file=sys.stderr); return 1
+    status, payload = RenderHandler.result
+    if status != "ok":
+        print(f"render: {payload}", file=sys.stderr); return 1
+    if out and out != "-":
+        with open(out, "wb") as f: f.write(payload)
+    else:
+        sys.stdout.buffer.write(payload); sys.stdout.buffer.flush()
+    return 0
+
+# ---------------------------------------------------------------- main
+def free_port():
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+
+def cli_apply(name):
+    p = load_presets()
+    name = name or p.get("login")
+    if not name:
+        print("No preset marked for login; nothing applied.", file=sys.stderr); return 0
+    vals = p["presets"].get(name)
+    if vals is None:
+        print(f"No preset named {name!r}", file=sys.stderr); return 1
+    vals = preset_controls(vals)
+    # camera module may still be probing right after boot
+    for _ in range(20):
+        if os.path.exists(DEVICE): break
+        time.sleep(0.5)
+    ok, err = set_controls(vals)
+    print(f"Applied preset {name!r}" if ok else f"Failed: {err}", file=sys.stderr)
+    return 0 if ok else 1
+
+def serve():
+    port = free_port()
+    Handler.streamer = Streamer(DEVICE)
+    Handler.colors = theme_colors()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd.daemon_threads = True
+    Handler.server_ref = httpd
+    url = f"http://127.0.0.1:{port}/layerbooth"  # path becomes part of Chromium's app id
+    if "--no-browser" not in sys.argv:
+        which = __import__("shutil").which
+        if which("omarchy-launch-webapp"):
+            cmd = ["omarchy-launch-webapp", url, "--window-size=1280,780"]
+        else:
+            browser = find_browser()
+            if not browser:
+                print("layerbooth: no Chromium-based browser found; open this URL yourself:", url, file=sys.stderr)
+                cmd = None
+            else:
+                cmd = [browser, f"--app={url}", "--window-size=1280,780"]
+        if cmd:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    else:
+        print(url, flush=True)
+
+    def idle_watch():
+        st = Handler.streamer
+        while True:
+            time.sleep(5)
+            if st.clients == 0 and time.time() - st.last_client > IDLE_EXIT_SECONDS:
+                httpd.shutdown(); return
+    threading.Thread(target=idle_watch, daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda *a: threading.Thread(target=httpd.shutdown).start())
+    try:
+        httpd.serve_forever()
+    finally:
+        Handler.streamer.stop()
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if "--device" in args:
+        DEVICE = args[args.index("--device") + 1]
+    else:
+        DEVICE = detect_device()
+    if "--devices" in args:
+        for dev, name in list_devices():
+            print(f"{dev}  {name}")
+        sys.exit(0)
+    if args and args[0] == "render":
+        sys.exit(render_cli(args[1:]))
+    if "--list" in args:
+        p = load_presets()
+        for n, v in sorted(p["presets"].items()):
+            c = preset_controls(v); nl = len(v["layers"]) if isinstance(v, dict) and "layers" in v else 0
+            print(("* " if p["login"] == n else "  ") + n + "  " + ", ".join(f"{k}={x}" for k, x in c.items()) + f"  [{nl} layers]")
+        sys.exit(0)
+    if "--apply" in args:
+        i = args.index("--apply")
+        name = args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("--") else None
+        sys.exit(cli_apply(name))
+    if "-h" in args or "--help" in args:
+        print(__doc__); sys.exit(0)
+    serve()

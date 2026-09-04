@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Layerbooth
+Comment=Photobooth with layers: camera controls, edge detection, gradients and presets
+Exec=layerbooth
+Icon=camera-photo
+Terminal=false
+Categories=Graphics;Photography;
+Keywords=camera;webcam;photobooth;effects;layers;

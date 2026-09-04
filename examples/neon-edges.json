@@ -1,0 +1,5 @@
+[
+  {"type": "camera", "enabled": true, "opacity": 0.35, "blend": "source-over"},
+  {"type": "edges", "enabled": true, "opacity": 1, "blend": "screen",
+   "threshold": 0.22, "thickness": 1.2, "smooth": 2, "color": "#00ff88", "bg": "transparent", "invert": false}
+]

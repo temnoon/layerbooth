@@ -1,0 +1,5 @@
+[
+  {"type": "color", "enabled": true, "opacity": 1, "blend": "source-over", "color": "#000000"},
+  {"type": "camera", "enabled": true, "opacity": 1, "blend": "source-over",
+   "mask": {"type": "radial", "cx": 0.5, "cy": 0.45, "start": 0.45, "end": 0.95, "invert": false}}
+]
