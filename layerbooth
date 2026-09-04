@@ -1292,9 +1292,44 @@ def render_cli(args):
     return 0
 
 # ---------------------------------------------------------------- page export (gravity-press PageSpec v1)
-PAPER_IN = {"LETTER": (8.5, 11), "A4": (8.27, 11.69), "A5": (5.83, 8.27), "HALF_LETTER": (5.5, 8.5)}
-PAPER_TRIM = {"LETTER": "0850X1100", "A5": "0583X0827", "HALF_LETTER": "0550X0850"}  # Lulu trims; A4 has none
+# Lulu trim codes are hundredths of an inch, WIDTHxHEIGHT. The first seven appear in Lulu's own
+# OpenAPI spec; A5 is what gravity-press already ships. Names are Lulu's product names.
+TRIMS = {
+    "0425X0687": "Pocket Book",
+    "0500X0800": "Novella",
+    "0550X0850": "Digest",
+    "0583X0827": "A5",
+    "0600X0900": "US Trade",
+    "0700X1000": "Executive",
+    "0827X1169": "A4",
+    "0850X1100": "US Letter",
+}
+# gravity-press PageSpec paper names (its PaperSize enum) and their trims
+PAPER_NAMES = {"LETTER": "0850X1100", "A4": "0827X1169", "A5": "0583X0827", "HALF_LETTER": "0550X0850"}
 STRUCTURES = {"lines": "lined", "dots": "dot", "grid": "cartesian", "polar": "polar"}
+
+def trim_inches(code):
+    m = re.fullmatch(r"(\d{4})X(\d{4})", code)
+    if not m:
+        raise ValueError(f"unknown paper {code!r}; use a name ({', '.join(PAPER_NAMES)}) or a Lulu trim code ({', '.join(TRIMS)})")
+    return int(m.group(1)) / 100, int(m.group(2)) / 100
+
+def resolve_paper(paper):
+    """Accepts LETTER/A4/A5/HALF_LETTER, a Lulu code like 0600X0900, or WxH inches like 6x9.
+    Returns (pagespec_paper_name_or_code, trim_code, width_in, height_in)."""
+    p = paper.strip().upper().replace("-", "_").replace('"', "")
+    if p in PAPER_NAMES:
+        code = PAPER_NAMES[p]
+    elif re.fullmatch(r"\d{4}X\d{4}", p):
+        code = p
+    elif re.fullmatch(r"\d+(\.\d+)?X\d+(\.\d+)?", p):
+        w, h = (float(x) for x in p.split("X"))
+        code = f"{int(round(w*100)):04d}X{int(round(h*100)):04d}"
+    else:
+        raise ValueError(f"unknown paper {paper!r}; use a name ({', '.join(PAPER_NAMES)}), a Lulu code ({', '.join(TRIMS)}) or WxH inches")
+    w_in, h_in = trim_inches(code)
+    names = {v: k for k, v in PAPER_NAMES.items()}
+    return names.get(code, code), code, w_in, h_in
 
 def blank_png(w, h):
     """A transparent w×h PNG without Pillow: one filter byte + RGBA zeros per row."""
@@ -1344,41 +1379,99 @@ def render_headless(data, layers, fmt="image/png", quality=0.92):
         raise RuntimeError(payload)
     return payload
 
-def build_page_spec(layers, paper="LETTER", dpi=150, ground="image", wash_opacity=0.12, structure="none",
-                    input_bytes=None, preset=None):
-    """Render the look at paper size and wrap it as a gravity-press PageSpec v1."""
-    import base64
-    if paper not in PAPER_IN:
-        raise ValueError(f"paper must be one of {', '.join(PAPER_IN)}")
-    w_in, h_in = PAPER_IN[paper]
-    w, h = int(round(w_in * dpi)), int(round(h_in * dpi))
+def has_raster(layers):
+    """Photos want JPEG; pattern-only pages (SVG, gradient, colour, edges) stay PNG."""
+    for L in layers:
+        if not L.get("enabled", True):
+            continue
+        if L.get("type") == "camera":
+            return True
+        if L.get("type") == "image" and not str(L.get("path", "")).lower().endswith(".svg"):
+            return True
+    return False
+
+def optimise_png(data):
+    """Shrink a PNG with ImageMagick when it is available; otherwise return it unchanged."""
+    import shutil
+    if not shutil.which("magick"):
+        return data
+    r = subprocess.run(["magick", "png:-", "-strip", "-define", "png:compression-level=9",
+                        "-define", "png:compression-filter=5", "png:-"], input=data, capture_output=True)
+    return r.stdout if r.returncode == 0 and 0 < len(r.stdout) < len(data) else data
+
+def render_ground(layers, w, h, input_bytes=None, image_format="auto", quality=0.88):
+    """Render the look at w×h. Returns (bytes, mime, sha256)."""
+    import hashlib
     if input_bytes is None:
         input_bytes = blank_png(w, h)          # camera layers draw nothing; SVG/gradient/colour layers carry the page
-    png = render_headless(input_bytes, layers)
-    image_cfg = {"version": 1, "type": "image", "paper": paper,
-                 "src": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+    fmt = image_format
+    if fmt == "auto":
+        fmt = "jpg" if (has_raster(layers) and input_bytes is not None) else "png"
+    if fmt == "jpg" and input_bytes is not None and has_raster(layers):
+        data, mime = render_headless(input_bytes, layers, "image/jpeg", quality), "image/jpeg"
+    else:
+        data, mime = optimise_png(render_headless(input_bytes, layers, "image/png")), "image/png"
+    return data, mime, hashlib.sha256(data).hexdigest()
+
+def build_page_spec(layers, paper="LETTER", dpi=150, ground="image", wash_opacity=0.12, structure="none",
+                    input_bytes=None, preset=None, image_format="auto", quality=0.88, assets=None):
+    """Render the look at paper size and wrap it as a gravity-press PageSpec v1.
+    With `assets` (a dict), the image is stored there by sha256 and referenced as asset:<sha256>
+    instead of being inlined, so repeated pages share one copy."""
+    import base64
+    paper_name, trim, w_in, h_in = resolve_paper(paper)
+    w, h = int(round(w_in * dpi)), int(round(h_in * dpi))
+    had_input = input_bytes is not None
+    data, mime, digest = render_ground(layers, w, h, input_bytes, image_format, quality)
+    if assets is not None:
+        assets[digest] = (data, mime)
+        src = f"asset:{digest}"
+    else:
+        src = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+    image_cfg = {"version": 1, "type": "image", "paper": paper_name, "src": src,
                  "fit": "cover", "offsetX": 0, "offsetY": 0}  # imageWidth/Height are page inches; default = full page
     if ground == "wash":
         g = {"kind": "wash", "config": image_cfg, "opacity": max(0.02, min(0.5, float(wash_opacity)))}
     else:
         g = {"kind": "image", "config": image_cfg}
-    spec = {"version": 1, "paper": paper, "ground": g, "structure": [], "content": [], "overlay": []}
+    spec = {"version": 1, "paper": paper_name, "ground": g, "structure": [], "content": [], "overlay": []}
     if structure and structure != "none":
         if structure not in STRUCTURES:
             raise ValueError(f"structure must be one of none, {', '.join(STRUCTURES)}")
-        spec["structure"].append({"kind": structure, "config": {"version": 1, "type": STRUCTURES[structure], "paper": paper}})
+        spec["structure"].append({"kind": structure, "config": {"version": 1, "type": STRUCTURES[structure], "paper": paper_name}})
     # Kept for re-editing in Layerbooth; the PageSpec parser drops unknown keys.
-    spec["layerbooth"] = {"preset": preset, "layers": layers, "dpi": dpi, "rendered": {"width": w, "height": h}}
+    spec["layerbooth"] = {"preset": preset, "layers": layers, "dpi": dpi, "trim": trim,
+                          "rendered": {"width": w, "height": h, "mime": mime, "sha256": digest}}
+    if paper_name not in PAPER_NAMES:
+        spec["layerbooth"]["note"] = (f"paper {paper_name} is a Lulu trim outside gravity-press's PaperSize enum "
+                                      "(LETTER, A4, A5, HALF_LETTER); it validates once the enum is extended")
     return spec
 
+def write_assets(assets, out_dir):
+    """assets/<sha256>.<ext> next to the spec; identical grounds are written once."""
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for digest, (data, mime) in assets.items():
+        ext = ".jpg" if mime == "image/jpeg" else ".png"
+        path = os.path.join(out_dir, digest + ext)
+        if not os.path.exists(path):
+            with open(path, "wb") as f:
+                f.write(data)
+        written.append(path)
+    return written
+
 def page_cli(args):
-    """page [--preset NAME | --layers FILE] [--paper LETTER|A4|A5|HALF_LETTER] [--dpi N]
+    """page [--preset NAME | --layers FILE] [--paper LETTER|A5|0600X0900|6x9] [--dpi N]
          [--ground image|wash] [--wash-opacity 0.12] [--structure none|lines|dots|grid|polar]
-         [--input IMAGE|-] [--document COUNT] [--title T] [--out FILE]
+         [--input IMAGE|-] [--image-format auto|png|jpg] [--quality 0.88]
+         [--assets DIR] [--document COUNT] [--title T] [--out FILE] [--trims]
     Renders a look at paper size and writes a gravity-press PageSpec v1 (or a DocumentSpec with
-    --document) as JSON to --out or stdout. Without --input the camera layers are blank."""
-    preset = layers_file = out = inp = title = None
+    --document) as JSON to --out or stdout. Without --input the camera layers are blank.
+    --assets DIR stores the ground as DIR/<sha256>.png|jpg and references it as asset:<sha256>,
+    so identical pages share one file. --trims lists the Lulu trim sizes."""
+    preset = layers_file = out = inp = title = assets_dir = None
     paper, dpi, ground, wash, structure, count = "LETTER", 150, "image", 0.12, "none", 0
+    image_format, quality = "auto", 0.88
     it = iter(args)
     for a in it:
         if a == "--preset": preset = next(it)
@@ -1392,6 +1485,14 @@ def page_cli(args):
         elif a == "--document": count = int(next(it))
         elif a == "--title": title = next(it)
         elif a == "--out": out = next(it)
+        elif a == "--image-format": image_format = next(it).lower().lstrip(".").replace("jpeg", "jpg")
+        elif a == "--quality": quality = float(next(it))
+        elif a == "--assets": assets_dir = next(it)
+        elif a == "--trims":
+            for code, name in TRIMS.items():
+                w_in, h_in = trim_inches(code)
+                print(f"{code}  {w_in:g} × {h_in:g} in  {name}")
+            return 0
         elif a in ("-h", "--help"): print(page_cli.__doc__); return 0
         else:
             print(f"page: unknown argument {a!r}", file=sys.stderr); return 2
@@ -1409,16 +1510,21 @@ def page_cli(args):
     data = None
     if inp:
         data = sys.stdin.buffer.read() if inp == "-" else open(inp, "rb").read()
+    assets = {} if assets_dir else None
     try:
-        spec = build_page_spec(layers, paper, dpi, ground, wash, structure, data, preset)
+        spec = build_page_spec(layers, paper, dpi, ground, wash, structure, data, preset, image_format, quality, assets)
     except (ValueError, RuntimeError) as e:
         print(f"page: {e}", file=sys.stderr); return 1
     if count:
-        if paper not in PAPER_TRIM:
-            print(f"page: {paper} has no print trim; use LETTER, A5 or HALF_LETTER for --document", file=sys.stderr); return 1
-        spec = {"version": 1, "trim": PAPER_TRIM[paper], "includeBleed": True,
+        trim = spec["layerbooth"]["trim"]
+        spec = {"version": 1, "trim": trim, "includeBleed": True,
                 "meta": {"title": title or preset or "Layerbooth notebook"},
                 "pages": [{"template": spec, "count": count}]}
+        if trim not in TRIMS:
+            print(f"page: note: {trim} is not a known Lulu trim; check Lulu's product sheet", file=sys.stderr)
+    if assets:
+        for path in write_assets(assets, assets_dir):
+            print(f"asset {path} ({os.path.getsize(path)//1024} KiB)", file=sys.stderr)
     text = json.dumps(spec)
     if out and out != "-":
         with open(out, "w") as f: f.write(text)
