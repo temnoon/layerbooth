@@ -124,6 +124,11 @@ layerbooth live --input pose.png --layers examples/neon-edges.json  # a still im
 layerbooth live --layers examples/greenscreen.json              # keyed camera over a gradient
 ```
 
+Or click **Go live** in the panel's toolbar: it pipes the panel's own composited
+preview to the loopback device — no second process, the camera stays with the
+panel, and you can keep editing layers while OBS watches. The panel window must
+stay visible; background windows stop painting, which would freeze the feed.
+
 In OBS: **Sources ➜ + ➜ Video Capture Device (V4L2) ➜ Layerbooth**, then scene
 switching, streaming and recording are OBS's job. The feed is video only — add
 your microphone as an audio source in OBS. `live` runs until Ctrl-C.
@@ -135,7 +140,8 @@ as a visible window (GPU-composited, and you can watch the feed being made);
 `LAYERBOOTH_GPU=1` tries the real GPU even headless. `LAYERBOOTH_DEBUG=1`
 prints per-stage timings. The camera can only be opened by one program at a
 time: close the panel (or pass `--source test`) if `live` reports the camera
-as busy.
+as busy — or just use the panel's **Go live** button, which shares the panel's
+camera instead.
 
 ### Notebook pages for gravity-press
 

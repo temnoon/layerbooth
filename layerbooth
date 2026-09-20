@@ -402,6 +402,17 @@ def list_loopbacks():
     found.sort(key=lambda d: d[1] != "Layerbooth")
     return found
 
+def resolve_loopback(out_arg=None):
+    """(device, card) for the loopback to write to; ValueError with the setup hint if none."""
+    loopbacks = list_loopbacks()
+    if out_arg:
+        return out_arg, next((c for d, c in loopbacks if d == out_arg), out_arg)
+    if not loopbacks:
+        raise ValueError("no v4l2loopback device found. Create one with:\n"
+                         "  sudo pacman -S v4l2loopback-dkms\n"
+                         '  sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Layerbooth" exclusive_caps=1')
+    return loopbacks[0]
+
 class LivePipe:
     """JPEG frames in, one ffmpeg process out to a v4l2loopback device (or to /dev/null)."""
     def __init__(self, device, fps):
@@ -500,6 +511,7 @@ class Guarded(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- web
 class Handler(Guarded):
     streamer: Streamer = None
+    live_pipe: LivePipe = None
     colors: dict = {}
     server_ref = None
 
@@ -534,8 +546,11 @@ class Handler(Guarded):
         elif u.path == "/stream":
             self._stream()
         elif u.path == "/state":
+            lp = Handler.live_pipe
             self._json({"device": DEVICE, "controls": list_controls(), "presets": load_presets(),
-                        "assets_dir": assets_dir()})
+                        "assets_dir": assets_dir(),
+                        "live": {"on": bool(lp), "device": lp.device if lp else None,
+                                 "card": getattr(lp, "card", None) if lp else None}})
         elif u.path == "/asset":
             serve_asset(self, (parse_qs(u.query).get("path") or [""])[0])
         else:
@@ -658,6 +673,32 @@ class Handler(Guarded):
                 return self._json({"ok": False, "error": "Not an SVG asset"}, 404)
             with open(real, "r", encoding="utf-8", errors="replace") as f:
                 self._json({"ok": True, "svg": f.read(MAX_ASSET_BODY)})
+        elif u.path == "/live/start":
+            try:
+                out_dev, card = resolve_loopback((self._body() or {}).get("device"))
+            except ValueError as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
+            if Handler.live_pipe:
+                Handler.live_pipe.stop()
+            Handler.live_pipe = LivePipe(out_dev, 30)
+            Handler.live_pipe.card = card
+            Handler.live_pipe.start()
+            self._json({"ok": True, "device": out_dev, "card": card})
+        elif u.path == "/live/frame":
+            if not Handler.live_pipe:
+                return self._json({"ok": False, "error": "live is not running"}, 409)
+            data = self.read_body(MAX_IMAGE_BODY)
+            if data is None:
+                return
+            if Handler.live_pipe.write(data):
+                self.send_response(204); self.end_headers()
+            else:
+                self._json({"ok": False, "error": "live output stopped"}, 503)
+        elif u.path == "/live/stop":
+            if Handler.live_pipe:
+                Handler.live_pipe.stop()
+                Handler.live_pipe = None
+            self._json({"ok": True})
         elif u.path == "/quit":
             self._json({"ok": True})
             threading.Thread(target=self.server_ref.shutdown, daemon=True).start()
@@ -1070,6 +1111,7 @@ input[type=color]{width:36px;height:24px;padding:0;border:1px solid var(--muted)
     <label class="check"><input type="checkbox" id="mirror" checked> Mirror preview</label>
     <span class="spacer"></span>
     <span class="status" id="status"></span>
+    <button id="live" onclick="goLive()">○ Go live</button>
     <button class="primary" onclick="snap()">📷 Snapshot</button>
     <button onclick="quit()">Close</button>
   </div>
@@ -1280,6 +1322,7 @@ function frame(){
   requestAnimationFrame(frame);
   if(!cam.complete||!cam.naturalWidth) return;
   composite();
+  if(liveOn) pushLive();
 }
 requestAnimationFrame(frame);
 
@@ -1326,6 +1369,44 @@ function pickKey(L){ // sample the composited preview for the chroma key colour
     L._open=true; renderLayers(); say('Key: '+L.mask.color);
   };
 }
+/* ---------------- go live (this page's compositor → v4l2loopback) ---------------- */
+let liveOn=false, liveLast=0, liveBusy=false;
+function setLiveButton(on,card){
+  liveOn=on;
+  const b=$('#live');
+  b.textContent=on?'● Live: '+(card||'OBS'):'○ Go live';
+  b.classList.toggle('primary',on);
+}
+async function goLive(){
+  if(liveOn) return stopLive();
+  const r=await post('/live/start',{});
+  if(!r.ok){ say(r.error||'Cannot start live'); return }
+  setLiveButton(true,r.card);
+  say('Live → '+r.card+' ('+r.device+')  ·  keep this window visible');
+}
+async function stopLive(){
+  setLiveButton(false);
+  await post('/live/stop');
+  say('Live stopped');
+}
+async function pushLive(){
+  const now=performance.now();
+  if(liveBusy||now-liveLast<33) return;
+  liveLast=now; liveBusy=true;
+  try{
+    const url=out.toDataURL('image/jpeg',0.75);
+    const b64=url.slice(url.indexOf(',')+1), bin=atob(b64), bytes=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    const r=await fetch('/live/frame',{method:'POST',headers:{'Content-Type':'image/jpeg','X-Token':TOKEN},body:bytes});
+    if(r.status!==204){
+      setLiveButton(false);
+      say(r.status===409?'Live was not running':'Live output stopped');
+      try{ await post('/live/stop') }catch(e){}
+    }
+  }catch(e){}
+  liveBusy=false;
+}
+window.addEventListener('beforeunload',()=>{ if(liveOn) try{ fetch('/live/stop',{method:'POST',headers:{'X-Token':TOKEN},body:'{}',keepalive:true}) }catch(e){} });
 /* ---------------- snapshot settings ---------------- */
 function loadSettings(){const st=state.presets.settings||{}; $('#sfolder').value=st.folder||'~/Pictures'; $('#stemplate').value=st.template||'camera-[datetime]'; previewName()}
 let ptimer=null;
@@ -1340,6 +1421,7 @@ async function saveSettings(){const r=await post('/settings',{folder:$('#sfolder
 async function openFolder(){await saveSettings(); post('/open-folder')}
 async function quit(){await post('/quit'); window.close(); document.body.innerHTML='<p style="padding:2em">Camera panel closed.</p>'}
 fetch('/state',{headers:{'X-Token':TOKEN}}).then(r=>r.json()).then(s=>{state=s; renderControls(); renderPresets(); renderLayers(); loadSettings();
+  if(s.live&&s.live.on) setLiveButton(true,s.live.card); // restore the toggle after a page reload
   if(s.presets.login) applyPreset(s.presets.login); // open with the login look, layers included
 });
 </script></body></html>""")
@@ -1658,7 +1740,6 @@ def live_cli(args):
     if not browser:
         print("live: needs a Chromium-based browser for compositing", file=sys.stderr); return 1
 
-    loopbacks = list_loopbacks()
     discard = out_arg == "null"
     if inp:
         data = sys.stdin.buffer.read() if inp == "-" else open(inp, "rb").read()
@@ -1677,18 +1758,14 @@ def live_cli(args):
     if discard:
         out_dev, card = None, "discard (debug)"
     elif out_arg:
-        out_dev = out_arg
-        card = next((c for d, c in loopbacks if d == out_arg), out_arg)
-        if not any(d == out_arg for d, _ in loopbacks):
+        out_dev, card = resolve_loopback(out_arg)
+        if not any(d == out_arg for d, _ in list_loopbacks()):
             print(f"live: warning: {out_arg} is not a v4l2loopback device; writing anyway", file=sys.stderr)
     else:
-        if not loopbacks:
-            print("live: no v4l2loopback device found. Create one with:\n"
-                  "  sudo pacman -S v4l2loopback-dkms\n"
-                  '  sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Layerbooth" exclusive_caps=1\n'
-                  "then rerun, or pass --out /dev/videoN.", file=sys.stderr)
-            return 1
-        out_dev, card = loopbacks[0]
+        try:
+            out_dev, card = resolve_loopback()
+        except ValueError as e:
+            print(f"live: {e}", file=sys.stderr); return 1
 
     pipe = LivePipe(out_dev, fps)
     LiveHandler.layers = layers
@@ -2097,6 +2174,8 @@ def serve():
         httpd.serve_forever()
     finally:
         Handler.streamer.stop()
+        if Handler.live_pipe:
+            Handler.live_pipe.stop()
         try:
             os.unlink(instance_file())
         except OSError:
