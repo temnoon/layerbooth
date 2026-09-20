@@ -30,6 +30,8 @@ Usage:
                                         composite a layer stack over a live foreground (camera, test
                                         pattern, another device, or a still image) and write it to a
                                         v4l2loopback camera that OBS and other video apps can use
+   layerbooth mcp                       Model Context Protocol server on stdio: agents read state, set
+                                        camera controls, manage presets, render looks, start/stop live
 """
 import glob, json, os, re, secrets, signal, socket, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -547,7 +549,8 @@ class Handler(Guarded):
             self._stream()
         elif u.path == "/state":
             lp = Handler.live_pipe
-            self._json({"device": DEVICE, "controls": list_controls(), "presets": load_presets(),
+            self._json({"device": DEVICE, "devices": [f"{d}  {n}" for d, n in list_devices()],
+                        "controls": list_controls(), "presets": load_presets(),
                         "assets_dir": assets_dir(),
                         "live": {"on": bool(lp), "device": lp.device if lp else None,
                                  "card": getattr(lp, "card", None) if lp else None}})
@@ -2176,6 +2179,312 @@ def page_cli(args):
         sys.stdout.write(text); sys.stdout.flush()
     return 0
 
+# ---------------------------------------------------------------- mcp (agent control over stdio)
+def panel_api(method, path, body=None):
+    """Talk to the running panel, if one is up. Returns (status, parsed json) or (0, None)."""
+    inst = running_instance()
+    if not inst or inst[1] is None:
+        return 0, None
+    import urllib.request, urllib.error
+    url = f"http://127.0.0.1:{inst[1]}{path}?t={inst[2]}" if "?" not in path else path
+    data = json.dumps(body).encode() if body is not None else (b"{}" if method == "POST" else None)
+    req = urllib.request.Request(url, data=data, method=method, headers={"X-Token": inst[2]})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            payload = r.read()
+            try: return r.status, json.loads(payload)
+            except ValueError: return r.status, None
+    except urllib.error.HTTPError as e:
+        try: return e.code, json.loads(e.read())
+        except Exception: return e.code, None
+    except OSError:
+        return 0, None
+
+_live_proc = None
+
+def mcp_state(args):
+    st, s = panel_api("GET", "/state")
+    if st == 200:
+        s["panel"] = True
+        return s
+    p = load_presets()
+    return {"panel": False, "device": DEVICE, "devices": [f"{d}  {n}" for d, n in list_devices()],
+            "controls": list_controls(), "presets": p,
+            "live": {"on": False}, "assets_dir": assets_dir()}
+
+def mcp_devices(args):
+    return {"devices": [f"{d}  {n}" for d, n in list_devices()]}
+
+def mcp_set_controls(args):
+    values = args.get("controls") or {}
+    st, r = panel_api("POST", "/set", values)
+    if st == 200:
+        return r
+    known = {c["name"] for c in list_controls()}
+    wanted = {k: int(v) for k, v in values.items() if k in known and isinstance(v, (int, float, bool))}
+    ok, err = set_controls(wanted)
+    return {"ok": ok, "error": err, "controls": list_controls()}
+
+def mcp_reset_controls(args):
+    st, r = panel_api("POST", "/reset", {})
+    if st == 200:
+        return r
+    set_controls({c["name"]: c["default"] for c in list_controls()})
+    return {"ok": True, "controls": list_controls()}
+
+def mcp_apply_preset(args):
+    name = args.get("name")
+    st, r = panel_api("POST", "/preset/apply", {"name": name})
+    if st == 200:
+        return r
+    p = load_presets()
+    preset = p["presets"].get(name)
+    if preset is None:
+        return {"error": f"no preset named {name!r}"}
+    ok, err = set_controls(preset_controls(preset))
+    return {"ok": ok, "error": err, "layers": preset.get("layers", [])}
+
+def mcp_save_preset(args):
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "preset needs a name"}
+    layers = args.get("layers") or []
+    st, r = panel_api("POST", "/preset/save", {"name": name, "layers": layers})
+    if st == 200 and r.get("ok"):
+        if args.get("login"):
+            panel_api("POST", "/preset/login", {"name": name})
+        return r
+    p = load_presets()
+    p["presets"][name] = {"controls": {c["name"]: c["value"] for c in list_controls()}, "layers": layers}
+    if args.get("login"):
+        p["login"] = name
+    save_presets(p)
+    return {"ok": True, "presets": p}
+
+def mcp_delete_preset(args):
+    name = args.get("name")
+    st, r = panel_api("POST", "/preset/delete", {"name": name})
+    if st == 200:
+        return r
+    p = load_presets()
+    p["presets"].pop(name, None)
+    if p["login"] == name:
+        p["login"] = None
+    save_presets(p)
+    return {"ok": True, "presets": p}
+
+def mcp_set_login(args):
+    name = args.get("name")
+    st, r = panel_api("POST", "/preset/login", {"name": name})
+    if st == 200:
+        return r
+    p = load_presets()
+    p["login"] = name if name in p["presets"] else None
+    save_presets(p)
+    return {"ok": True, "presets": p}
+
+def mcp_assets(args):
+    d = assets_dir()
+    return {"dir": d, "assets": sorted(f"{f}  ({os.path.getsize(os.path.join(d, f))//1024} KiB)"
+                                       for f in os.listdir(d) if os.path.splitext(f)[1] in ASSET_EXTS)}
+
+def mcp_render(args):
+    preset, layers_file, layers_json = args.get("preset"), args.get("layers_file"), args.get("layers")
+    out, fmt = args.get("out"), (args.get("format") or "png").lower().lstrip(".")
+    quality = max(0.0, min(1.0, float(args.get("quality", 0.92))))
+    if preset:
+        p = load_presets()
+        if preset not in p["presets"]:
+            return {"error": f"no preset named {preset!r}"}
+        layers = p["presets"][preset]["layers"]
+    elif layers_file:
+        with open(layers_file) as f:
+            layers = json.load(f)
+        if isinstance(layers, dict): layers = layers.get("layers", [])
+    elif layers_json is not None:
+        layers = layers_json if isinstance(layers_json, list) else json.loads(layers_json)
+    else:
+        layers = [DEFAULT_LAYER]
+    inp = args.get("input")
+    data = open(inp, "rb").read() if inp else blank_png(1280, 720)
+    rendered = render_headless(data, layers, {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                                              "webp": "image/webp"}.get(fmt, "image/png"), quality)
+    if not out:
+        return {"error": "give an output path, e.g. /tmp/look.png"}
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(rendered)
+    return {"ok": True, "out": out, "bytes": len(rendered), "format": fmt}
+
+def mcp_live_start(args):
+    global _live_proc
+    if _live_proc and _live_proc.poll() is None:
+        return {"error": f"live is already running (pid {_live_proc.pid}); stop it first"}
+    import shutil
+    cmd = [shutil.which("layerbooth") or os.path.abspath(__file__), "live"]
+    if args.get("preset"):
+        cmd += ["--preset", str(args["preset"])]
+    elif args.get("layers_file"):
+        cmd += ["--layers", str(args["layers_file"])]
+    cmd += ["--source", str(args.get("source") or "camera")]
+    if args.get("size"): cmd += ["--size", str(args["size"])]
+    if args.get("fps"): cmd += ["--fps", str(args["fps"])]
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(os.path.join(CONFIG_DIR, "live.log"), "ab") as logf:
+        _live_proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
+    time.sleep(3)
+    if _live_proc.poll() is not None:
+        tail = open(os.path.join(CONFIG_DIR, "live.log"), "rb").read()[-500:].decode(errors="replace")
+        _live_proc = None
+        return {"error": "live exited immediately: " + (tail or "no output")}
+    return {"ok": True, "pid": _live_proc.pid,
+            "hint": "OBS sees it as the Layerbooth camera (Video Capture Device V4L2)"}
+
+def mcp_live_status(args):
+    running = bool(_live_proc and _live_proc.poll() is None)
+    st, s = panel_api("GET", "/state")
+    panel_live = s.get("live", {}) if st == 200 else {}
+    return {"running": running or panel_live.get("on", False),
+            "cli": {"pid": _live_proc.pid if running else None},
+            "panel": panel_live if panel_live.get("on") else None}
+
+def mcp_live_stop(args):
+    global _live_proc
+    stopped = []
+    if _live_proc and _live_proc.poll() is None:
+        try: os.killpg(os.getpgid(_live_proc.pid), signal.SIGTERM)
+        except OSError: _live_proc.terminate()
+        stopped.append(_live_proc.pid)
+    _live_proc = None
+    st, r = panel_api("POST", "/live/stop", {})
+    if st == 200 and r.get("ok"):
+        stopped.append("panel")
+    return {"ok": True, "stopped": stopped or None}
+
+MCP_TOOLS = [
+    {"name": "layerbooth_state",
+     "description": "Full Layerbooth state: camera device and devices, every V4L2 control with value/min/max/default, all presets, snapshot settings, live status.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "layerbooth_devices",
+     "description": "List V4L2 capture devices (path and name).",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "layerbooth_set_controls",
+     "description": "Set V4L2 camera controls (e.g. brightness, saturation). Names and valid ranges come from layerbooth_state.",
+     "inputSchema": {"type": "object",
+                     "properties": {"controls": {"type": "object", "additionalProperties": {"type": "number"},
+                                                 "description": "control name → integer value"}},
+                     "required": ["controls"]}},
+    {"name": "layerbooth_reset_controls",
+     "description": "Reset all camera controls to driver defaults.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "layerbooth_apply_preset",
+     "description": "Apply a saved preset: camera controls plus its layer stack.",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "layerbooth_save_preset",
+     "description": "Save a preset holding the current camera controls plus the given layer stack. Layers follow the layerbooth layer schema: {type: camera|image|warp|edges|color|gradient, ...}, each with opacity, blend and an optional mask (linear|radial|image|edges|chroma).",
+     "inputSchema": {"type": "object",
+                     "properties": {"name": {"type": "string"},
+                                    "layers": {"type": "array", "items": {"type": "object"},
+                                               "description": "layer stack, bottom first; omit for a controls-only preset"},
+                                    "login": {"type": "boolean", "description": "also mark it as the login preset"}},
+                     "required": ["name"]}},
+    {"name": "layerbooth_delete_preset",
+     "description": "Delete a saved preset.",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "layerbooth_set_login",
+     "description": "Mark a preset (by name, or null for none) to be applied at login.",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": ["string", "null"]}}, "required": ["name"]}},
+    {"name": "layerbooth_assets",
+     "description": "List uploaded/downloaded image and SVG assets usable by image and warp layers.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "layerbooth_render",
+     "description": "Composite a layer stack (or a preset) over an image with the headless compositor and write the result — the same output the panel shows.",
+     "inputSchema": {"type": "object",
+                     "properties": {"preset": {"type": "string"},
+                                    "layers": {"type": "array", "items": {"type": "object"}},
+                                    "layers_file": {"type": "string"},
+                                    "input": {"type": "string", "description": "path to a JPEG/PNG/WebP/GIF; omit for a blank canvas"},
+                                    "out": {"type": "string", "description": "output file path"},
+                                    "format": {"enum": ["png", "jpg", "webp"]},
+                                    "quality": {"type": "number", "description": "0-1 for jpg/webp"}}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "layerbooth_live_start",
+     "description": "Send a live composited feed to the v4l2loopback camera that OBS (and every video app) sees as 'Layerbooth'. Runs the standalone headless compositor; fails with guidance if the panel holds the camera.",
+     "inputSchema": {"type": "object",
+                     "properties": {"preset": {"type": "string"},
+                                    "layers_file": {"type": "string"},
+                                    "source": {"type": "string", "enum": ["camera", "test"],
+                                               "description": "foreground source; a /dev/videoN path also works; 'test' needs no camera"},
+                                    "size": {"type": "string", "description": "WxH, e.g. 960x540 — cheaper than full size"},
+                                    "fps": {"type": "number"}}}},
+    {"name": "layerbooth_live_status",
+     "description": "Whether a live feed is running (standalone or via the panel), and where it is writing.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "layerbooth_live_stop",
+     "description": "Stop the live feed (standalone and/or panel).",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+MCP_DISPATCH = {
+    "layerbooth_state": mcp_state, "layerbooth_devices": mcp_devices,
+    "layerbooth_set_controls": mcp_set_controls, "layerbooth_reset_controls": mcp_reset_controls,
+    "layerbooth_apply_preset": mcp_apply_preset, "layerbooth_save_preset": mcp_save_preset,
+    "layerbooth_delete_preset": mcp_delete_preset, "layerbooth_set_login": mcp_set_login,
+    "layerbooth_assets": mcp_assets, "layerbooth_render": mcp_render,
+    "layerbooth_live_start": mcp_live_start, "layerbooth_live_status": mcp_live_status,
+    "layerbooth_live_stop": mcp_live_stop,
+}
+
+def mcp_server():
+    """MCP stdio server: newline-delimited JSON-RPC. Diagnostics go to stderr only."""
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        method, mid = msg.get("method"), msg.get("id")
+        try:
+            if method == "initialize":
+                send({"jsonrpc": "2.0", "id": mid, "result": {
+                    "protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "layerbooth", "version": "0.2"}}})
+            elif method == "ping":
+                send({"jsonrpc": "2.0", "id": mid, "result": {}})
+            elif method == "tools/list":
+                send({"jsonrpc": "2.0", "id": mid, "result": {"tools": MCP_TOOLS}})
+            elif method == "tools/call":
+                params = msg.get("params") or {}
+                name, args = params.get("name"), params.get("arguments") or {}
+                fn = MCP_DISPATCH.get(name)
+                if fn is None:
+                    send({"jsonrpc": "2.0", "id": mid, "result": {"content": [
+                        {"type": "text", "text": f"unknown tool {name!r}"}], "isError": True}})
+                    continue
+                try:
+                    out = fn(args)
+                    send({"jsonrpc": "2.0", "id": mid, "result": {
+                        "content": [{"type": "text", "text": json.dumps(out, indent=1, default=str)}],
+                        "isError": isinstance(out, dict) and "error" in out}})
+                except Exception as e:
+                    send({"jsonrpc": "2.0", "id": mid, "result": {"content": [
+                        {"type": "text", "text": f"{type(e).__name__}: {e}"}], "isError": True}})
+            elif mid is not None:
+                send({"jsonrpc": "2.0", "id": mid,
+                      "error": {"code": -32601, "message": f"unknown method {method}"}})
+        except Exception as e:
+            print(f"mcp: {e}", file=sys.stderr, flush=True)
+
 # ---------------------------------------------------------------- main
 def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
@@ -2201,13 +2510,14 @@ def instance_file():
     return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or CONFIG_DIR, "layerbooth.instance")
 
 def running_instance():
-    """PID of a live panel server started by this user, or None."""
+    """(pid, port, token) of a live panel server started by this user, or None."""
     try:
         with open(instance_file()) as f:
-            pid = int(f.read().strip())
+            parts = f.read().split()
+        pid = int(parts[0])
         os.kill(pid, 0)
-        return pid
-    except (OSError, ValueError):
+        return (pid, int(parts[1]), parts[2]) if len(parts) >= 3 else (pid, None, None)
+    except (OSError, ValueError, IndexError):
         return None
 
 def focus_existing():
@@ -2265,7 +2575,7 @@ def serve():
     signal.signal(signal.SIGTERM, lambda *a: threading.Thread(target=httpd.shutdown).start())
     try:
         with open(instance_file(), "w") as f:
-            f.write(str(os.getpid()))
+            f.write(f"{os.getpid()} {port} {Handler.token}")  # the MCP server attaches through this
     except OSError:
         pass
     try:
@@ -2295,6 +2605,9 @@ if __name__ == "__main__":
         sys.exit(page_cli(args[1:]))
     if args and args[0] == "live":
         sys.exit(live_cli(args[1:]))
+    if args and args[0] == "mcp":
+        mcp_server()
+        sys.exit(0)
     if "--list" in args:
         p = load_presets()
         for n, v in sorted(p["presets"].items()):

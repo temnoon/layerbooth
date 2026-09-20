@@ -147,6 +147,21 @@ time: close the panel (or pass `--source test`) if `live` reports the camera
 as busy — or just use the panel's **Go live** button, which shares the panel's
 camera instead.
 
+### Agent control (MCP)
+
+`layerbooth mcp` speaks [Model Context Protocol](https://modelcontextprotocol.io)
+over stdio: agents read the camera state, set V4L2 controls, save, apply and
+delete presets, render looks with the headless compositor, and start/stop the
+live feed. It routes through the running panel when one is up (sharing its
+camera and state) and works standalone otherwise. Register it in
+`~/.config/opencode/opencode.json`:
+
+```json
+{ "mcp": { "layerbooth": { "type": "local", "command": ["layerbooth", "mcp"] } } }
+```
+
+Any MCP client works the same way (e.g. `mcpServers` in Claude Desktop).
+
 ### Notebook pages for gravity-press
 
 A look can become a writing surface. `layerbooth page` renders the layer
