@@ -45,6 +45,7 @@ overrides:
     recommends:
       - chromium | chromium-browser | google-chrome-stable
       - libnotify-bin
+      - v4l2loopback-dkms
   rpm:
     depends:
       - python3 >= 3.10
@@ -53,6 +54,7 @@ overrides:
     recommends:
       - chromium
       - libnotify
+      - v4l2loopback
 
 deb:
   # Debian expects the license text at this path.

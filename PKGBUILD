@@ -8,7 +8,8 @@ url='https://github.com/temnoon/layerbooth'
 license=('MIT')
 depends=('python' 'ffmpeg' 'v4l-utils')
 optdepends=('chromium: panel window and headless rendering (any Chromium-based browser works)'
-            'libnotify: snapshot notifications outside Omarchy')
+            'libnotify: snapshot notifications outside Omarchy'
+            'v4l2loopback-dkms: layerbooth live virtual camera for OBS')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('3c9fc2cf5ccb22d12dd19170418d8b156ec62278210b2ff9b615ca5feea291d2')
 

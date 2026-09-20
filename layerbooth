@@ -22,11 +22,16 @@ Usage:
                               [--quality 0-1] [--out FILE] [INPUT|-]
                                        apply a layer stack to an image: reads INPUT (or stdin),
                                        writes the composited image to --out (or stdout)
-  layerbooth page [--preset NAME | --layers FILE] [--paper A5] [--structure dots] [--out page.json]
-                                       render a look at paper size and write a gravity-press
-                                       PageSpec v1 (or a DocumentSpec with --document COUNT)
+   layerbooth page [--preset NAME | --layers FILE] [--paper A5] [--structure dots] [--out page.json]
+                                        render a look at paper size and write a gravity-press
+                                        PageSpec v1 (or a DocumentSpec with --document COUNT)
+   layerbooth live [--preset NAME | --layers FILE] [--source camera|test|DEVICE]
+                   [--input IMAGE] [--out DEVICE] [--fps N] [--quality 0-1]
+                                        composite a layer stack over a live foreground (camera, test
+                                        pattern, another device, or a still image) and write it to a
+                                        v4l2loopback camera that OBS and other video apps can use
 """
-import json, os, re, secrets, signal, socket, subprocess, sys, threading, time
+import glob, json, os, re, secrets, signal, socket, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, unquote
 
@@ -110,6 +115,21 @@ def serve_asset(handler, path):
     handler.send_header("Content-Type", ASSET_EXTS[os.path.splitext(real)[1].lower()])
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+def serve_asset_text(handler):
+    """POST /asset/text: the SVG source of an asset, for stroke recolouring."""
+    raw = handler.read_body(MAX_JSON_BODY) or b"{}"
+    try:
+        real = asset_ok(json.loads(raw).get("path"))
+    except (ValueError, AttributeError):
+        real = None
+    svg = open(real, encoding="utf-8", errors="replace").read() if real else ""
+    body = json.dumps({"ok": bool(real), "svg": svg}).encode()
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -276,9 +296,10 @@ def theme_colors():
 
 # ---------------------------------------------------------------- streamer
 class Streamer:
-    """One ffmpeg process reading the camera; frames fanned out to clients."""
-    def __init__(self, device):
+    """One ffmpeg process reading a camera (or the test pattern); frames fanned out to clients."""
+    def __init__(self, device=None, cmd=None):
         self.device = device
+        self.cmd = cmd  # explicit ffmpeg command; None = read self.device
         self.proc = None
         self.lock = threading.Condition()
         self.frame = None
@@ -289,7 +310,9 @@ class Streamer:
     def start(self):
         if self.proc and self.proc.poll() is None:
             return
-        if native_mjpeg(self.device):
+        if self.cmd:
+            cmd = self.cmd
+        elif native_mjpeg(self.device):
             cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "v4l2", "-input_format", "mjpeg",
                    "-i", self.device, "-c:v", "copy", "-f", "mpjpeg", "-"]
         else:
@@ -331,6 +354,101 @@ class Streamer:
         with self.lock:
             self.lock.wait_for(lambda: self.seq != seen, timeout=2)
             return self.frame, self.seq
+
+def foreground_streamer(source):
+    """A Streamer for the live foreground: a camera device or the built-in test pattern."""
+    if source == "test":
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi",
+               "-i", "testsrc2=size=1280x720:rate=30", "-f", "mpjpeg", "-q:v", "4", "-"]
+        return Streamer(cmd=cmd)
+    return Streamer(source)
+
+def serve_stream(handler, s):
+    """GET /stream: the MJPEG fan-out, shared by the panel and the live compositor."""
+    s.start()
+    s.clients += 1
+    handler.send_response(200)
+    handler.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.end_headers()
+    seen = -1
+    try:
+        while True:
+            frame, seen = s.next_frame(seen)
+            if frame is None:
+                continue
+            handler.wfile.write(f"--{BOUNDARY}\r\nContent-Type: image/jpeg\r\n"
+                                f"Content-Length: {len(frame)}\r\n\r\n".encode())
+            handler.wfile.write(frame)
+            handler.wfile.write(b"\r\n")
+            handler.wfile.flush()
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        s.clients -= 1
+        s.last_client = time.time()
+
+# ---------------------------------------------------------------- live out (v4l2loopback)
+def list_loopbacks():
+    """[(path, card)] for every v4l2loopback device, Layerbooth-labelled ones first."""
+    found = []
+    for dev in sorted(glob.glob("/dev/video*")):
+        info = subprocess.run(["v4l2-ctl", "-d", dev, "--info"], capture_output=True, text=True).stdout
+        def field(name, info=info):
+            return next((l.split(":", 1)[1].strip() for l in info.splitlines()
+                         if l.split(":", 1)[0].strip() == name), "")
+        if field("Driver name") == "v4l2loopback":
+            found.append((dev, field("Card type") or dev))
+    found.sort(key=lambda d: d[1] != "Layerbooth")
+    return found
+
+class LivePipe:
+    """JPEG frames in, one ffmpeg process out to a v4l2loopback device (or to /dev/null)."""
+    def __init__(self, device, fps):
+        self.device, self.fps = device, fps
+        self.proc = None
+        self.lock = threading.Lock()
+        self.sent = 0
+        self.errs = []
+
+    def start(self, discard=False):
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "image2pipe",
+               "-framerate", str(self.fps), "-i", "-", "-an",
+               "-c:v", "rawvideo", "-pix_fmt", "yuv420p"]
+        cmd += ["-f", "null", "-"] if discard else ["-f", "v4l2", self.device]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.errs = []
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        for line in self.proc.stderr:
+            if len(self.errs) < 15:
+                self.errs.append(line.decode(errors="replace").rstrip())
+        self.proc.wait()
+
+    def write(self, jpeg):
+        if not self.proc or self.proc.poll() is not None:
+            return False
+        try:
+            with self.lock:
+                self.proc.stdin.write(jpeg)
+                self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return False
+        self.sent += 1
+        return True
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+            self.proc.terminate()
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
 # ---------------------------------------------------------------- request guard
 MAX_JSON_BODY = 1 << 20        # 1 MiB of JSON is plenty for a layer stack
@@ -547,29 +665,7 @@ class Handler(Guarded):
             self.send_error(404)
 
     def _stream(self):
-        s = self.streamer
-        s.start()
-        s.clients += 1
-        self.send_response(200)
-        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        seen = -1
-        try:
-            while True:
-                frame, seen = s.next_frame(seen)
-                if frame is None:
-                    continue
-                self.wfile.write(f"--{BOUNDARY}\r\nContent-Type: image/jpeg\r\n"
-                                 f"Content-Length: {len(frame)}\r\n\r\n".encode())
-                self.wfile.write(frame)
-                self.wfile.write(b"\r\n")
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-        finally:
-            s.clients -= 1
-            s.last_client = time.time()
+        serve_stream(self, self.streamer)
 
 def theme_css(c):
     def g(k, d): return c.get(k, d)
@@ -582,7 +678,10 @@ def theme_css(c):
 
 LAYER_DEF = r"""function defaultLayer(type){
   const base={id:uid++,type,enabled:true,opacity:1,blend:'source-over',
-    mask:{type:'none',angle:0,cx:0.5,cy:0.5,start:0.2,end:0.8,invert:false}};
+    mask:{type:'none',angle:0,cx:0.5,cy:0.5,start:0.2,end:0.8,invert:false,
+      path:'',mode:'alpha',fit:'contain',scale:1,x:0.5,y:0.5,rotate:0,
+      color:'#00ff00',similarity:0.3,smoothness:0.1,spill:0,
+      threshold:0.2,thickness:1,smooth:1.5}};
   if(type==='edges') Object.assign(base,{threshold:0.2,thickness:1,smooth:1.5,color:'#ffffff',bg:'transparent',invert:false});
   if(type==='color') Object.assign(base,{color:'#000000'});
   if(type==='gradient') Object.assign(base,{color:'#000000',color2:'#ffffff',alpha1:1,alpha2:1,angle:90,shape:'linear'});
@@ -593,20 +692,20 @@ LAYER_DEF = r"""function defaultLayer(type){
 """
 
 RENDER_CORE = r"""/* ---------------- assets: pick, fetch, prime patterns ---------------- */
-async function setAsset(L,path){L.path=path; L._open=true; renderLayers(); say('Asset: '+path.split('/').pop())}
-function pickFile(L){
+async function setAsset(L,path,key='path'){L[key]=path; L._open=true; renderLayers(); say('Asset: '+path.split('/').pop())}
+function pickFile(L,key='path'){
   const inp=document.createElement('input'); inp.type='file'; inp.accept='.svg,.png,.jpg,.jpeg,.webp,.gif,image/*';
   inp.onchange=async()=>{const f=inp.files[0]; if(!f)return;
     const r=await fetch('/asset/upload',{method:'POST',headers:{'X-Token':TOKEN,'X-Filename':encodeURIComponent(f.name),'Content-Type':'application/octet-stream'},body:f}).then(r=>r.json());
-    if(r.ok) setAsset(L,r.path); else say(r.error)};
+    if(r.ok) setAsset(L,r.path,key); else say(r.error)};
   inp.click();
 }
-async function fetchAsset(L,url){say('Fetching…'); const r=await post('/asset/fetch',{url}); if(r.ok) setAsset(L,r.path); else say(r.error)}
-async function primeAsset(L){
+async function fetchAsset(L,url,key='path'){say('Fetching…'); const r=await post('/asset/fetch',{url}); if(r.ok) setAsset(L,r.path,key); else say(r.error)}
+async function primeAsset(L,key='path'){
   const n=prompt('Prime (or any number; the next prime is used)', '97'); if(!n) return;
   const mode=prompt('Mode: tree, spiral, mandala, walk, burst, wave', 'mandala'); if(!mode) return;
   const color=prompt('Colour scheme: prime, fire, ice, mono, rainbow', 'mono')||'mono';
-  fetchAsset(L,`https://api.fractal-core.com/api/v1/svg?n=${encodeURIComponent(n.trim())}&mode=${encodeURIComponent(mode.trim())}&color=${encodeURIComponent(color.trim())}&background=none`);
+  fetchAsset(L,`https://api.fractal-core.com/api/v1/svg?n=${encodeURIComponent(n.trim())}&mode=${encodeURIComponent(mode.trim())}&color=${encodeURIComponent(color.trim())}&background=none`,key);
 }
 /* ---------------- rendering: WebGL Sobel + 2D compositor ---------------- */
 const cam=$('#cam'), out=$('#out'), ctx=out.getContext('2d');
@@ -671,6 +770,45 @@ if(gl){
   wtexSrc=mk(); wtexFld=mk();
   for(const n of ['src','fld','px','effect','strength','p1','p2','p3','col','m']) wuni[n]=gl.getUniformLocation(wprog,n);
 }
+/* ---- key program: chroma key (greenscreen) and luminance masks ---- */
+let kprog=null,kuni={},ktex=null;
+if(gl){
+  const sh=(t,src)=>{const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));return s};
+  const kvs=`attribute vec2 p;varying vec2 v;void main(){v=vec2(p.x*.5+.5,p.y*.5+.5);gl_Position=vec4(p,0.,1.);}`;
+  const kfs=`precision mediump float;varying vec2 v;uniform sampler2D src;uniform vec3 key;uniform float sim,smoothness,spill,thr,sm;uniform int mode,inv;
+  void main(){
+    vec4 t=texture2D(src,v); vec3 c=t.rgb; float a;
+    if(mode==0){ // chroma: distance in chroma space (YCbCr without Y); spill pulled back along the key hue only
+      float y=dot(c,vec3(.299,.587,.114)); float ky=dot(key,vec3(.299,.587,.114));
+      vec2 kc=vec2(key.b-ky,key.r-ky); float kl=length(kc)+1e-5; kc/=kl;
+      vec2 cc=vec2(c.b-y,c.r-y);
+      a=smoothstep(sim,sim+smoothness+0.001,length(cc-kc*kl));
+      float over=max(0.,dot(cc,kc))*spill*a;
+      cc-=kc*over;
+      float B=y+cc.x, R=y+cc.y;
+      c=vec3(R,(y-0.299*R-0.114*B)/0.587,B);
+    } else { a=smoothstep(thr,thr+sm+0.001,dot(c,vec3(.299,.587,.114))); } // luminance
+    if(inv==1) a=1.-a;
+    gl_FragColor=vec4(c*a,a);
+  }`;
+  kprog=gl.createProgram(); gl.attachShader(kprog,sh(gl.VERTEX_SHADER,kvs)); gl.attachShader(kprog,sh(gl.FRAGMENT_SHADER,kfs)); gl.linkProgram(kprog);
+  const kt=()=>{const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR); return t};
+  ktex=kt();
+  for(const n of ['src','key','sim','smoothness','spill','thr','sm','mode','inv']) kuni[n]=gl.getUniformLocation(kprog,n);
+}
+function renderKey(p,srcEl){ // p: {mode:'chroma'|'luma', color, similarity, smoothness, spill, threshold, smooth, invert}
+  if(!gl||!kprog) return null;
+  gl.useProgram(kprog); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,ktex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,srcEl);
+  gl.uniform1i(kuni.mode,p.mode==='luma'?1:0);
+  gl.uniform3fv(kuni.key,hex(p.color||'#00ff00'));
+  gl.uniform1f(kuni.sim,p.similarity??0.3); gl.uniform1f(kuni.smoothness,p.smoothness??0.1);
+  gl.uniform1f(kuni.spill,p.spill||0); gl.uniform1f(kuni.thr,p.threshold??0); gl.uniform1f(kuni.sm,p.smooth??1);
+  gl.uniform1i(kuni.inv,p.invert?1:0);
+  gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  gl.useProgram(prog); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex);
+  return glc;
+}
 function tiltMatrix(tx,ty,persp,spin){ // column-major mat4: rotate the plane in 3D, perspective via w
   const rx=(tx-0.5)*Math.PI*0.8, ry=(ty-0.5)*Math.PI*0.8, rz=(spin-0.5)*Math.PI*2, f=0.6+persp*3;
   const mul=(A,B)=>A.map((row,i)=>[0,1,2].map(j=>row[0]*B[0][j]+row[1]*B[1][j]+row[2]*B[2][j]));
@@ -709,10 +847,11 @@ function assetImage(path,stroke,strokeScale){
 }
 async function preloadAssets(){ // headless render: wait for every referenced asset before compositing
   const waits=[];
-  for(const L of layers){ if(!L.path) continue;
-    assetImage(L.path, L.type==='image'?L.stroke:'', L.type==='image'?L.strokeScale:1);
-    if(L.type==='warp') assetImage(L.path,'',1);
-    for(const [k,e] of assetCache) if(k.startsWith(L.path+'|')) waits.push(e.ready);
+  const wait=(p,stroke,ss)=>{ if(!p) return; assetImage(p,stroke,ss); for(const [k,e] of assetCache) if(k.startsWith(p+'|')) waits.push(e.ready); };
+  for(const L of layers){
+    if(L.path) wait(L.path, L.type==='image'?L.stroke:'', L.type==='image'?L.strokeScale:1);
+    if(L.type==='warp') wait(L.path,'',1);
+    if(L.mask && L.mask.type==='image' && L.mask.path) wait(L.mask.path,'',1);
   }
   await Promise.all(waits);
 }
@@ -743,6 +882,14 @@ function fieldCanvas(L){
   c2.filter='none';
   fieldCache.set(L.id,{key,canvas:c}); return c;
 }
+const msk=document.createElement('canvas');
+function maskCanvas(img,m){ // mask asset rasterised on black, for luminance masks
+  if(msk.width!==W||msk.height!==H){msk.width=W;msk.height=H}
+  const c2=msk.getContext('2d');
+  c2.globalCompositeOperation='source-over'; c2.globalAlpha=1;
+  c2.fillStyle='#000'; c2.fillRect(0,0,W,H);
+  drawFitted(c2,img,m); return msk;
+}
 function renderWarp(L,srcEl){
   if(!gl||!wprog) return null;
   const isField=!['kaleido','tilt'].includes(L.effect);
@@ -763,10 +910,12 @@ function renderWarp(L,srcEl){
 const hex=h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)/255);
 const rgba=(h,a)=>{const [r,g,b]=hex(h).map(x=>Math.round(x*255));return `rgba(${r},${g},${b},${a})`};
 let camUploaded=false;
-function renderEdges(L){
+function renderEdges(L,srcEl){
   if(!gl) return null;
+  srcEl=srcEl||cam;
   gl.useProgram(prog); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex);
-  if(!camUploaded){gl.bindTexture(gl.TEXTURE_2D,tex); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,cam); camUploaded=true}
+  if(srcEl===cam){ if(!camUploaded){gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,cam); camUploaded=true} }
+  else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,srcEl);
   gl.uniform1f(uni.thr,L.threshold); gl.uniform1f(uni.thick,L.thickness); gl.uniform1f(uni.sm,L.smooth); gl.uniform3fv(uni.col,hex(L.color));
   gl.uniform1i(uni.mode,L.bg==='transparent'?0:L.bg==='black'?1:2); gl.uniform1i(uni.inv,L.invert?1:0);
   gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
@@ -792,7 +941,7 @@ function drawSource(L){
     tctx.fillStyle=g; tctx.fillRect(0,0,W,H);
   }
   const m=L.mask;
-  if(m.type!=='none'){
+  if(m.type==='linear'||m.type==='radial'){
     let g;
     if(m.type==='radial'){ const r=Math.hypot(W,H)/2; g=tctx.createRadialGradient(m.cx*W,m.cy*H,0,m.cx*W,m.cy*H,r); }
     else { g=tctx.createLinearGradient(...linearCoords(m.angle)); }
@@ -802,6 +951,24 @@ function drawSource(L){
     if(e>s) g.addColorStop(e,`rgba(0,0,0,${a1})`); else g.addColorStop(Math.min(1,e+0.0001),`rgba(0,0,0,${a1})`);
     g.addColorStop(1,`rgba(0,0,0,${a1})`);
     tctx.globalCompositeOperation='destination-in'; tctx.fillStyle=g; tctx.fillRect(0,0,W,H);
+  }
+  else if(m.type==='image' && m.path){
+    const img=assetImage(m.path,'',1);
+    if(img){
+      tctx.globalCompositeOperation='destination-in';
+      if(m.mode==='luminance'){
+        const g=renderKey({mode:'luma',threshold:m.threshold,smooth:m.smooth,invert:m.invert},maskCanvas(img,m));
+        if(g) tctx.drawImage(g,0,0);
+      } else drawFitted(tctx,img,m);
+    }
+  }
+  else if(m.type==='edges'){
+    const g=renderEdges({threshold:m.threshold??0.2,thickness:m.thickness??1,smooth:m.smooth??1.5,color:'#ffffff',bg:'transparent',invert:m.invert},tmp);
+    if(g){ tctx.globalCompositeOperation='destination-in'; tctx.drawImage(g,0,0); }
+  }
+  else if(m.type==='chroma'){
+    const g=renderKey({mode:'chroma',color:m.color,similarity:m.similarity,smoothness:m.smoothness,spill:m.spill,invert:m.invert},tmp);
+    if(g){ tctx.globalCompositeOperation='destination-in'; tctx.drawImage(g,0,0); }
   }
   return tmp;
 }
@@ -824,8 +991,14 @@ function composite(){
 LOAD_LAYERS = r"""function loadLayers(ls){
   if(!ls||!ls.length) ls=[{type:'camera'}];
   const okColor=c=>/^#[0-9a-fA-F]{6}$/.test(c);
+  const MASK_TYPES=['none','linear','radial','image','edges','chroma'];
   layers=ls.map(L=>{const d=defaultLayer(TYPE_NAME[L.type]?L.type:'camera'); const m={...d.mask,...(L.mask||{})}; const out={...d,...L,id:uid++,mask:m};
     if(!BLENDS.includes(out.blend)) out.blend='source-over';
+    if(!MASK_TYPES.includes(m.type)) m.type='none';
+    if(m.type==='image' && !['alpha','luminance'].includes(m.mode)) m.mode='alpha';
+    if(m.color!==undefined && !okColor(m.color)) m.color=d.mask.color;
+    if(m.path!==undefined) m.path=String(m.path||'');
+    for(const k of ['angle','cx','cy','start','end','scale','x','y','rotate','similarity','smoothness','spill','threshold','thickness','smooth']) if(m[k]!==undefined) m[k]=Number(m[k])||0;
     for(const k of ['color','color2']) if(out[k]!==undefined && !okColor(out[k])) out[k]=d[k]||'#000000';
     for(const k of ['opacity','threshold','thickness','smooth','alpha1','alpha2','angle','scale','x','y','rotate','strokeScale','blur','strength','p1','p2','p3']) if(out[k]!==undefined) out[k]=Number(out[k])||0;
     if(out.type==='warp' && !EFFECTS[out.effect]) out.effect='displace';
@@ -910,7 +1083,7 @@ input[type=color]{width:36px;height:24px;padding:0;border:1px solid var(--muted)
     <select id="addtype"><option value="camera">Camera</option><option value="image">Image / SVG</option><option value="warp">Warp (geometry effect)</option><option value="edges">Edges</option><option value="color">Colour</option><option value="gradient">Gradient</option></select>
     <button class="icon" onclick="addLayer()">+ Add</button></h2>
   <div id="layers"></div>
-  <div class="status">Top of the list is drawn on top. Masks carve each layer's alpha with a gradient.</div>
+  <div class="status">Top of the list is drawn on top. Masks carve each layer's alpha: gradient, image/SVG, edge detection, chroma key.</div>
 
   <h2>Presets</h2>
   <div id="presets"></div>
@@ -1031,15 +1204,42 @@ function renderLayers(){
       <label>Colour B</label><div class="row"><input type="color" data-key="color2" value="${esc(L.color2)}"></div>
       ${range('Alpha B','alpha2',0,1,0.01,L,v=>Math.round(v*100)+'%')}
       ${range('Angle','angle',0,360,1,L,v=>v+'°')}`;
-    body+=`</div><div class="sub"><h3>Alpha mask</h3><div class="grid">
-      <label>Type</label><select data-key="mask.type"><option value="none" ${L.mask.type==='none'?'selected':''}>none</option><option value="linear" ${L.mask.type==='linear'?'selected':''}>linear gradient</option><option value="radial" ${L.mask.type==='radial'?'selected':''}>radial gradient</option></select>
-      ${range('Angle','mask.angle',0,360,1,{['mask.angle']:L.mask.angle},v=>v+'°')}
-      ${range('Centre X','mask.cx',0,1,0.01,{['mask.cx']:L.mask.cx})}
-      ${range('Centre Y','mask.cy',0,1,0.01,{['mask.cy']:L.mask.cy})}
-      ${range('Opaque until','mask.start',0,1,0.01,{['mask.start']:L.mask.start})}
-      ${range('Clear after','mask.end',0,1,0.01,{['mask.end']:L.mask.end})}
-      <label>Invert</label><input type="checkbox" data-key="mask.invert" ${L.mask.invert?'checked':''}>
-    </div></div>`;
+    body+=`</div><div class="sub"><h3>Alpha mask</h3><div class="grid">`;
+    const m=L.mask;
+    body+=`<label>Type</label><select data-key="mask.type">${[['none','none'],['linear','linear gradient'],['radial','radial gradient'],['image','image / SVG'],['edges','edge detection'],['chroma','chroma key (greenscreen)']].map(([v,l])=>`<option value="${v}" ${m.type===v?'selected':''}>${l}</option>`).join('')}</select>`;
+    if(m.type==='linear') body+=`
+      ${range('Angle','mask.angle',0,360,1,{['mask.angle']:m.angle},v=>v+'°')}
+      ${range('Opaque until','mask.start',0,1,0.01,{['mask.start']:m.start})}
+      ${range('Clear after','mask.end',0,1,0.01,{['mask.end']:m.end})}
+      <label>Invert</label><input type="checkbox" data-key="mask.invert" ${m.invert?'checked':''}>`;
+    if(m.type==='radial') body+=`
+      ${range('Centre X','mask.cx',0,1,0.01,{['mask.cx']:m.cx})}
+      ${range('Centre Y','mask.cy',0,1,0.01,{['mask.cy']:m.cy})}
+      ${range('Opaque until','mask.start',0,1,0.01,{['mask.start']:m.start})}
+      ${range('Clear after','mask.end',0,1,0.01,{['mask.end']:m.end})}
+      <label>Invert</label><input type="checkbox" data-key="mask.invert" ${m.invert?'checked':''}>`;
+    if(m.type==='image') body+=`
+      <label>File</label><div class="row"><input type="text" data-key="mask.path" value="${esc(m.path||'')}" placeholder="path to .svg .png .jpg" style="flex:1;min-width:0"></div>
+      <span></span><div class="row"><button class="icon act-mask-upload">Upload…</button><button class="icon act-mask-url">URL…</button><button class="icon act-mask-prime">Prime…</button></div>
+      <label>Read as</label><select data-key="mask.mode"><option value="alpha" ${m.mode==='alpha'?'selected':''}>alpha (shapes' own transparency)</option><option value="luminance" ${m.mode==='luminance'?'selected':''}>luminance (brightness)</option></select>
+      <label>Fit</label><select data-key="mask.fit">${['contain','cover','stretch','tile'].map(f=>`<option value="${f}" ${m.fit===f?'selected':''}>${f}</option>`).join('')}</select>
+      ${range('Scale','mask.scale',0.05,4,0.01,{['mask.scale']:m.scale??1})}
+      ${range('Position X','mask.x',0,1,0.01,{['mask.x']:m.x??0.5})}
+      ${range('Position Y','mask.y',0,1,0.01,{['mask.y']:m.y??0.5})}
+      ${range('Rotate','mask.rotate',-180,180,1,{['mask.rotate']:m.rotate??0},v=>v+'°')}
+      <label>Invert</label><input type="checkbox" data-key="mask.invert" ${m.invert?'checked':''}>`;
+    if(m.type==='edges') body+=`
+      ${range('Threshold','mask.threshold',0,1,0.01,{['mask.threshold']:m.threshold??0.2})}
+      ${range('Thickness','mask.thickness',0.5,4,0.1,{['mask.thickness']:m.thickness??1})}
+      ${range('Smoothing','mask.smooth',0,6,0.1,{['mask.smooth']:m.smooth??1.5})}
+      <label>Invert</label><input type="checkbox" data-key="mask.invert" ${m.invert?'checked':''}>`;
+    if(m.type==='chroma') body+=`
+      <label>Key colour</label><div class="row"><input type="color" data-key="mask.color" value="${esc(m.color||'#00ff00')}"><button class="icon act-mask-pick" title="Click the preview to sample the key colour">Pick from preview…</button></div>
+      ${range('Similarity','mask.similarity',0,1,0.005,{['mask.similarity']:m.similarity??0.3})}
+      ${range('Smoothness','mask.smoothness',0,1,0.005,{['mask.smoothness']:m.smoothness??0.1})}
+      ${range('Spill reduce','mask.spill',0,1,0.01,{['mask.spill']:m.spill||0})}
+      <label>Invert</label><input type="checkbox" data-key="mask.invert" ${m.invert?'checked':''}>`;
+    body+=`</div></div>`;
     d.innerHTML=`<summary><input type="checkbox" ${L.enabled?'checked':''} data-key="enabled" title="Enable" onclick="event.stopPropagation()">
       <span class="lname">${esc(TYPE_NAME[L.type]||L.type)}</span><span class="dim">${esc(BLEND_LABEL[L.blend]||L.blend)} · ${Math.round(L.opacity*100)}%</span>
       <button class="icon" title="Move up (toward front)">▲</button><button class="icon" title="Move down">▼</button><button class="icon danger" title="Delete">✕</button></summary>
@@ -1054,7 +1254,13 @@ function renderLayers(){
     if(bUrl) bUrl.onclick=e=>{e.preventDefault(); const u=prompt('Image or SVG URL'); if(u) fetchAsset(L,u)};
     if(bPrime) bPrime.onclick=e=>{e.preventDefault(); primeAsset(L)};
     if(bOwn) bOwn.onclick=e=>{e.preventDefault(); L.stroke=''; L._open=true; renderLayers()};
+    const mUp=d.querySelector('.act-mask-upload'), mUrl=d.querySelector('.act-mask-url'), mPrime=d.querySelector('.act-mask-prime'), mPick=d.querySelector('.act-mask-pick');
+    if(mUp) mUp.onclick=e=>{e.preventDefault();e.stopPropagation(); pickFile(L,'mask.path')};
+    if(mUrl) mUrl.onclick=e=>{e.preventDefault();e.stopPropagation(); const u=prompt('Image or SVG URL'); if(u) fetchAsset(L,u,'mask.path')};
+    if(mPrime) mPrime.onclick=e=>{e.preventDefault();e.stopPropagation(); primeAsset(L,'mask.path')};
+    if(mPick) mPick.onclick=e=>{e.preventDefault();e.stopPropagation(); pickKey(L)};
     const effSel=d.querySelector('select[data-key=effect]'); if(effSel) effSel.addEventListener('change',()=>{L._open=true; renderLayers()});
+    const mSel=d.querySelector('select[data-key="mask.type"]'); if(mSel) mSel.addEventListener('change',()=>{L._open=true; renderLayers()});
     d.querySelectorAll('[data-key]').forEach(el=>{
       const apply=()=>{
         let v = el.type==='checkbox'?el.checked : el.type==='range'?+el.value : el.value;
@@ -1107,6 +1313,18 @@ async function snap(){
   const blob=await new Promise(res=>out.toBlob(res,'image/png'));
   const r=await fetch('/snapshot',{method:'POST',headers:{'Content-Type':'image/png','X-Token':TOKEN,'X-Preset':encodeURIComponent(currentPreset)},body:blob}).then(r=>r.json());
   say(r.ok?'Saved '+r.path.split('/').pop():r.error);
+}
+function pickKey(L){ // sample the composited preview for the chroma key colour
+  say('Click the preview to pick the key colour');
+  out.onclick=e=>{
+    out.onclick=null;
+    const r=out.getBoundingClientRect();
+    let x=(e.clientX-r.left)*out.width/r.width, y=(e.clientY-r.top)*out.height/r.height;
+    if(out.classList.contains('mirror')) x=out.width-x;
+    const p=ctx.getImageData(Math.max(0,Math.min(out.width-1,Math.round(x))),Math.max(0,Math.min(out.height-1,Math.round(y))),1,1).data;
+    L.mask.color='#'+[p[0],p[1],p[2]].map(v=>v.toString(16).padStart(2,'0')).join('');
+    L._open=true; renderLayers(); say('Key: '+L.mask.color);
+  };
 }
 /* ---------------- snapshot settings ---------------- */
 function loadSettings(){const st=state.presets.settings||{}; $('#sfolder').value=st.folder||'~/Pictures'; $('#stemplate').value=st.template||'camera-[datetime]'; previewName()}
@@ -1187,14 +1405,7 @@ class RenderHandler(Guarded):
 
     def do_POST(self):
         if urlparse(self.path).path == "/asset/text":
-            raw = self.read_body(MAX_JSON_BODY) or b"{}"
-            try:
-                real = asset_ok(json.loads(raw).get("path"))
-            except (ValueError, AttributeError):
-                real = None
-            body = json.dumps({"ok": bool(real), "svg": open(real, encoding="utf-8", errors="replace").read() if real else ""}).encode()
-            self.send_response(200); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            serve_asset_text(self)
             return
         data = self.read_body(MAX_IMAGE_BODY)
         if data is None:
@@ -1289,6 +1500,263 @@ def render_cli(args):
         with open(out, "wb") as f: f.write(payload)
     else:
         sys.stdout.buffer.write(payload); sys.stdout.buffer.flush()
+    return 0
+
+# ---------------------------------------------------------------- live (layer stack → v4l2loopback for OBS)
+LIVE_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>layerbooth live</title></head>
+<body style="margin:0;background:#000"><canvas id="out" width="1280" height="720"></canvas><img id="cam" alt="" hidden>
+<script>
+const $=s=>document.querySelector(s);
+const TOKEN='/*TOKEN*/';
+$('#cam').src='/*CAM_SRC*/?t='+encodeURIComponent(TOKEN);
+let W=1280,H=720; let uid=1;
+const BLENDS=['source-over','multiply','screen','overlay','darken','lighten','color-dodge','color-burn','hard-light','soft-light','difference','exclusion','hue','saturation','color','luminosity'];
+const TYPE_NAME={camera:'Camera',edges:'Edges',color:'Colour',gradient:'Gradient',image:'Image',warp:'Warp'};
+const EFFECTS={displace:1,refract:1,emboss:1,contour:1,chroma:1,flow:1,kaleido:1,tilt:1};
+/*LAYER_DEF*/
+let layers=[defaultLayer('camera')];
+function renderLayers(){}
+/*RENDER_CORE*/
+/*LOAD_LAYERS*/
+const FPS=/*FPS*/, QUALITY=/*QUALITY*/;
+const SIZE_W=/*SIZE_W*/, SIZE_H=/*SIZE_H*/;
+const DEBUG=/*DEBUG*/;
+const trace=m=>{ if(DEBUG) console.error(m) };
+let started=false;
+async function pump(){
+  const interval=1000/FPS; let last=0, prev=null;
+  for(;;){
+    const now=performance.now();
+    await new Promise(r=>setTimeout(r,Math.max(0,last+interval-now)));
+    if(!cam.complete||!cam.naturalWidth) continue;
+    let t0=DEBUG?performance.now():0;
+    composite();
+    if(DEBUG) trace('composite '+(performance.now()-t0).toFixed(0)+'ms');
+    const url=out.toDataURL('image/jpeg',QUALITY);  // toBlob stalls in headless once compositor frames stop
+    if(DEBUG) trace('encode '+(performance.now()-t0).toFixed(0)+'ms '+(url.length>>10)+'KB');
+    if(url===prev){ last=performance.now(); continue; }  // still foreground: skip identical frames
+    prev=url;
+    const b64=url.slice(url.indexOf(',')+1), bin=atob(b64), bytes=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    try{
+      const r=await fetch('/live-frame',{method:'POST',headers:{'Content-Type':'image/jpeg','X-Token':TOKEN},body:bytes});
+      trace('post '+r.status);
+    }catch(e){ trace('post failed: '+e) }
+    last=performance.now();
+  }
+}
+function go(){
+  if(started) return; started=true;
+  trace('first frame '+cam.naturalWidth+'x'+cam.naturalHeight);
+  setSize(SIZE_W||cam.naturalWidth, SIZE_H||cam.naturalHeight);
+  loadLayers(/*LAYERS_JSON*/);
+  preloadAssets().then(pump);
+}
+cam.onload=go;
+if(cam.complete&&cam.naturalWidth) go();
+</script></body></html>"""
+
+class LiveHandler(Guarded):
+    """Serves the live compositor page, the foreground stream, and receives its frames."""
+    streamer: Streamer = None
+    pipe: LivePipe = None
+    layers = []
+    fps = 30
+    quality = 0.8
+    size = (0, 0)  # composite at a fixed WxH (0 = the foreground's own size)
+    input_bytes = b""
+    input_type = "image/jpeg"
+    use_input = False
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/live":
+            body = (assemble(LIVE_PAGE)
+                    .replace("/*LAYERS_JSON*/", json.dumps(self.layers).replace("</", "<\\/"))
+                    .replace("/*FPS*/", str(self.fps))
+                    .replace("/*QUALITY*/", str(float(self.quality)))
+                    .replace("/*SIZE_W*/", str(self.size[0] or 0))
+                    .replace("/*SIZE_H*/", str(self.size[1] or 0))
+                    .replace("/*DEBUG*/", "true" if "LAYERBOOTH_DEBUG" in os.environ else "false")
+                    .replace("/*CAM_SRC*/", "/input" if self.use_input else "/stream")
+                    .replace("/*TOKEN*/", self.token)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/stream":
+            serve_stream(self, self.streamer)
+        elif path == "/input":
+            self.send_response(200)
+            self.send_header("Content-Type", self.input_type)
+            self.send_header("Content-Length", str(len(self.input_bytes)))
+            self.end_headers()
+            self.wfile.write(self.input_bytes)
+        elif path == "/asset":
+            serve_asset(self, (parse_qs(urlparse(self.path).query).get("path") or [""])[0])
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/asset/text":
+            serve_asset_text(self)
+        elif path == "/live-frame":
+            data = self.read_body(MAX_IMAGE_BODY)
+            if data is None:
+                return
+            self.pipe.write(data)
+            self.send_response(204)
+            self.end_headers()
+        else:
+            self.send_error(404)
+
+def live_cli(args):
+    """live [--preset NAME | --layers FILE] [--source camera|test|DEVICE] [--input IMAGE]
+            [--out DEVICE|null] [--fps N] [--quality 0-1] [--size WxH]
+    Composite a layer stack over a live foreground — the camera, the built-in test pattern,
+    another V4L2 device, or a still image (--input) — and write the result to a v4l2loopback
+    camera, so OBS and every other video app see it as an ordinary webcam. --size composites
+    at a fixed WxH (cheaper than the foreground's own size; OBS rescales); --headed runs the
+    compositor in a visible window (GPU-composited, much faster than headless software
+    rendering). --out null decodes and discards the frames (debugging)."""
+    import tempfile
+    preset = layers_file = inp = out_arg = None
+    source, fps, quality = "camera", 30, 0.8
+    size = (0, 0)
+    headed = False
+    it = iter(args)
+    for a in it:
+        if a == "--preset": preset = next(it)
+        elif a == "--layers": layers_file = next(it)
+        elif a == "--source": source = next(it)
+        elif a == "--input": inp = next(it)
+        elif a == "--out": out_arg = next(it)
+        elif a == "--fps": fps = max(1, int(next(it)))
+        elif a == "--quality": quality = max(0.0, min(1.0, float(next(it))))
+        elif a == "--size":
+            w, h = next(it).lower().split("x")
+            size = (int(w), int(h))
+        elif a == "--headed": headed = True
+        elif a in ("-h", "--help"):
+            print(live_cli.__doc__); return 0
+        else:
+            print(f"live: unknown argument {a!r}", file=sys.stderr); return 2
+    if preset:
+        p = load_presets()
+        if preset not in p["presets"]:
+            print(f"live: no preset named {preset!r}", file=sys.stderr); return 1
+        layers = p["presets"][preset]["layers"]
+    elif layers_file:
+        with open(layers_file) as f:
+            layers = json.load(f)
+        if isinstance(layers, dict): layers = layers.get("layers", [])
+    else:
+        layers = [DEFAULT_LAYER]
+    browser = find_browser()
+    if not browser:
+        print("live: needs a Chromium-based browser for compositing", file=sys.stderr); return 1
+
+    loopbacks = list_loopbacks()
+    discard = out_arg == "null"
+    if inp:
+        data = sys.stdin.buffer.read() if inp == "-" else open(inp, "rb").read()
+        if not data:
+            print("live: no input image", file=sys.stderr); return 2
+        use_input, input_bytes, input_type = True, data, sniff_type(data)
+        streamer, src_desc = None, f"still image {inp}" if inp != "-" else "image on stdin"
+    else:
+        src = "test" if source == "test" else (DEVICE if source == "camera" else source)
+        if src != "test" and not os.path.exists(src):
+            print(f"live: no camera at {src} — check --devices, or try --source test", file=sys.stderr); return 1
+        use_input, input_bytes, input_type = False, b"", "image/jpeg"
+        streamer = foreground_streamer(src)
+        src_desc = "the built-in test pattern" if src == "test" else f"camera {src}"
+
+    if discard:
+        out_dev, card = None, "discard (debug)"
+    elif out_arg:
+        out_dev = out_arg
+        card = next((c for d, c in loopbacks if d == out_arg), out_arg)
+        if not any(d == out_arg for d, _ in loopbacks):
+            print(f"live: warning: {out_arg} is not a v4l2loopback device; writing anyway", file=sys.stderr)
+    else:
+        if not loopbacks:
+            print("live: no v4l2loopback device found. Create one with:\n"
+                  "  sudo pacman -S v4l2loopback-dkms\n"
+                  '  sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Layerbooth" exclusive_caps=1\n'
+                  "then rerun, or pass --out /dev/videoN.", file=sys.stderr)
+            return 1
+        out_dev, card = loopbacks[0]
+
+    pipe = LivePipe(out_dev, fps)
+    LiveHandler.layers = layers
+    LiveHandler.fps = fps
+    LiveHandler.quality = quality
+    LiveHandler.size = size
+    LiveHandler.streamer = streamer
+    LiveHandler.pipe = pipe
+    LiveHandler.input_bytes = input_bytes
+    LiveHandler.input_type = input_type
+    LiveHandler.use_input = use_input
+    LiveHandler.token = secrets.token_urlsafe(32)
+    LiveHandler.port = port = free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), LiveHandler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    pipe.start(discard)
+    if streamer:
+        streamer.start()
+    print(f"Layerbooth live → {card}" + (f" ({out_dev})" if out_dev else "") + f", {fps} fps"
+          + (f", {size[0]}x{size[1]}" if size[0] else ""))
+    print(f"Foreground: {src_desc}")
+    if not discard:
+        print(f'In OBS: Sources ➜ + ➜ Video Capture Device (V4L2) ➜ "{card}"')
+    print("Ctrl-C to stop.")
+    started_at, warned = time.time(), False
+    debug = "LAYERBOOTH_DEBUG" in os.environ
+    with tempfile.TemporaryDirectory(prefix="layerbooth-live-", dir=os.environ.get("XDG_RUNTIME_DIR"),
+                                     ignore_cleanup_errors=True) as profile:
+        flags = ["--no-first-run", "--no-default-browser-check",
+                 "--disable-extensions", f"--user-data-dir={profile}", "--window-size=1280,720"]
+        if not headed:
+            flags.insert(0, "--headless=new")
+            if "LAYERBOOTH_GPU" not in os.environ:
+                flags.append("--disable-gpu")  # SwiftShader is reliable; LAYERBOOTH_GPU=1 tries the real GPU
+        if debug:
+            flags.append("--enable-logging=stderr")
+        proc = subprocess.Popen([browser, *flags, f"http://127.0.0.1:{port}/live?t={LiveHandler.token}"],
+                                stdout=subprocess.DEVNULL, stderr=None if debug else subprocess.DEVNULL)
+        signal.signal(signal.SIGTERM, lambda *a: proc.terminate())
+        try:
+            while True:
+                time.sleep(0.5)
+                if proc.poll() is not None:
+                    print("live: compositing browser exited", file=sys.stderr); break
+                if pipe.proc and pipe.proc.poll() is not None:
+                    print("live: ffmpeg output stopped: " + (" | ".join(pipe.errs[-3:]) or "no error output"),
+                          file=sys.stderr); break
+                if streamer and streamer.proc and streamer.proc.poll() is not None:
+                    hint = (" — the layerbooth panel may be holding the camera; close it, or use --source test"
+                            if running_instance() else "")
+                    print(f"live: foreground stream stopped{hint}", file=sys.stderr); break
+                if not pipe.sent and not warned and time.time() - started_at > 20:
+                    warned = True
+                    print("live: no composited frames yet — is the foreground producing video?", file=sys.stderr)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    httpd.shutdown()
+    if streamer:
+        streamer.stop()
+    pipe.stop()
+    print(f"live: sent {pipe.sent} frames")
     return 0
 
 # ---------------------------------------------------------------- page export (gravity-press PageSpec v1)
@@ -1648,6 +2116,8 @@ if __name__ == "__main__":
         sys.exit(render_cli(args[1:]))
     if args and args[0] == "page":
         sys.exit(page_cli(args[1:]))
+    if args and args[0] == "live":
+        sys.exit(live_cli(args[1:]))
     if "--list" in args:
         p = load_presets()
         for n, v in sorted(p["presets"].items()):

@@ -1,0 +1,6 @@
+[
+  {"type": "gradient", "shape": "linear", "angle": 90,
+   "color": "#181825", "color2": "#89b4fa", "alpha1": 1, "alpha2": 1},
+  {"type": "camera", "opacity": 1, "blend": "source-over",
+   "mask": {"type": "chroma", "color": "#00ff00", "similarity": 0.3, "smoothness": 0.1, "spill": 0.5}}
+]

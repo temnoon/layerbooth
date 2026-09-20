@@ -41,8 +41,12 @@ layerbooth --apply "Borg"       # apply a named preset
 - **Camera** — every V4L2 control the driver offers, live. Double-click a
   slider to return it to its default.
 - **Layers** — a stack drawn bottom to top. Each layer has a blend mode,
-  opacity, and an optional alpha mask that fades it along a linear or radial
-  gradient. Sources:
+  opacity, and an alpha mask. Masks: linear or radial gradients; an image or
+  SVG read by its own transparency or by brightness (luminance matte); edge
+  detection of the layer itself (keep the lines, or everything but them); and
+  a chroma key with similarity, smoothness, spill reduction, and a key colour
+  picked straight from the preview. Chroma-key the camera and any layer
+  underneath becomes the background. Sources:
   - **Camera** — the live feed.
   - **Image / SVG** — a JPEG, PNG, WebP, GIF or SVG from a file on disk, an
     upload (copied into `~/.config/layerbooth/assets/`), or a URL. Fit
@@ -95,6 +99,43 @@ panel's Prime… button, or `curl` it from
 Image and warp layers reference assets by absolute path. A preset file from
 `~/.config/layerbooth/presets.json` also works as `--layers`, its `layers` key
 is used.
+
+### Live into OBS (and every other video app)
+
+The `live` subcommand composites a layer stack over a live foreground and
+writes the result to a v4l2loopback device — a virtual camera that OBS, Zoom
+and every browser see as an ordinary webcam.
+
+One-time setup (Arch: `sudo pacman -S v4l2loopback-dkms`):
+
+```
+sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Layerbooth" exclusive_caps=1
+# persist across reboots:
+echo v4l2loopback | sudo tee /etc/modules-load.d/layerbooth.conf
+echo 'options v4l2loopback devices=1 video_nr=10 card_label="Layerbooth" exclusive_caps=1' | sudo tee /etc/modprobe.d/layerbooth.conf
+```
+
+```
+layerbooth live --preset Borg      # your camera, composited with the preset
+layerbooth live                    # plain camera pass-through
+layerbooth live --source test      # built-in test pattern instead of the camera
+layerbooth live --source /dev/video2                          # another capture device
+layerbooth live --input pose.png --layers examples/neon-edges.json  # a still image
+layerbooth live --layers examples/greenscreen.json              # keyed camera over a gradient
+```
+
+In OBS: **Sources ➜ + ➜ Video Capture Device (V4L2) ➜ Layerbooth**, then scene
+switching, streaming and recording are OBS's job. The feed is video only — add
+your microphone as an audio source in OBS. `live` runs until Ctrl-C.
+
+The compositor is a headless browser, so effects cost real CPU. On a modest
+machine, `--size 960x540` (or `640x360`) and `--fps 15` trade resolution and
+rate for smoothness — OBS rescales either way. `--headed` runs the compositor
+as a visible window (GPU-composited, and you can watch the feed being made);
+`LAYERBOOTH_GPU=1` tries the real GPU even headless. `LAYERBOOTH_DEBUG=1`
+prints per-stage timings. The camera can only be opened by one program at a
+time: close the panel (or pass `--source test`) if `live` reports the camera
+as busy.
 
 ### Notebook pages for gravity-press
 
