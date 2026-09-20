@@ -50,10 +50,14 @@ layerbooth --apply "Borg"       # apply a named preset
   - **Camera** — the live feed.
   - **Image / SVG** — a JPEG, PNG, WebP, GIF or SVG from a file on disk, an
     upload (copied into `~/.config/layerbooth/assets/`), or a URL. Fit
-    (contain, cover, stretch, tile), scale, position, rotation. For SVGs the
-    stroke colour and stroke width can be overridden so a line drawing can be
-    recoloured to match a look. The **Prime…** button fetches one of the six
-    prime-number patterns from [fractal-core](https://fractal-core.com)
+    (contain, cover, stretch, tile), scale, position, rotation. Animated GIFs
+    and WebP play with a **Speed** control (0.1–4×); SVGs can **Draw-on**
+    stroke-by-stroke, looping; any image layer can **Spin** (°/s) for living
+    backgrounds. Stills (`render`, `page`) freeze animations at the completed
+    state. For SVGs the stroke colour and stroke width can be overridden so a
+    line drawing can be recoloured to match a look. The **Prime…** button
+    fetches one of the six prime-number patterns from
+    [fractal-core](https://fractal-core.com)
     (tree, spiral, mandala, walk, burst, wave) for any prime.
   - **Warp** — uses the geometry of an image or SVG (the *field*, rasterised
     and blurred into a height map) to push the pixels of either the camera or
